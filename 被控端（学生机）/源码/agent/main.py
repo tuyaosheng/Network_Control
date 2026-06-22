@@ -285,16 +285,31 @@ class AgentCore:
                 raise RuntimeError("无活动用户会话")
 
             user_token = win32ts.WTSQueryUserToken(session_id)
+            # pywin32 签名: DuplicateTokenEx(ExistingToken, ImpersonationLevel,
+            #   DesiredAccess, TokenType, TokenAttributes=None)
             primary_token = win32security.DuplicateTokenEx(
-                user_token, win32con.TOKEN_ALL_ACCESS, None,
-                win32security.SecurityImpersonation, win32security.TokenPrimary
+                user_token,
+                win32security.SecurityImpersonation,  # ImpersonationLevel
+                win32con.TOKEN_ALL_ACCESS,            # DesiredAccess
+                win32security.TokenPrimary,           # TokenType
             )
             si = win32process.STARTUPINFO()
             si.lpDesktop = "winsta0\\default"
             cmd = f'"{exe}" --lock "{unlock_hash}"'
+
+            # 必须传【用户】环境块：否则子进程继承 SYSTEM 环境，PyInstaller 单文件解压到
+            # SYSTEM 的 %TEMP%（用户令牌无权写）、Qt 取不到用户环境，锁屏进程会一启动就秒退。
+            import win32profile
+            try:
+                env = win32profile.CreateEnvironmentBlock(user_token, False)
+            except Exception:
+                env = None
+            workdir = os.path.dirname(exe) or None
+            CREATE_UNICODE_ENVIRONMENT = 0x00000400
             info = win32process.CreateProcessAsUser(
                 primary_token, None, cmd, None, None, False,
-                win32con.NORMAL_PRIORITY_CLASS, None, None, si
+                win32con.NORMAL_PRIORITY_CLASS | CREATE_UNICODE_ENVIRONMENT,
+                env, workdir, si
             )
             pid = info[2]
             win32api.CloseHandle(info[0])

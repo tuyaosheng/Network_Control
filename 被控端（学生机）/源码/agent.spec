@@ -25,6 +25,7 @@ a = Analysis(
         'win32security',
         'win32ts',
         'win32process',
+        'win32profile',
         'winerror',
         # agent 内部模块（_run() 中动态 import，PyInstaller 静态扫描不到）
         'agent.main',
@@ -83,5 +84,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    uac_admin=True,
+    # 不要求管理员清单：服务由 SCM 以 SYSTEM 启动不受影响；安装走已提权的 install_agent.bat；
+    # 而锁屏要 CreateProcessAsUser 注入【用户会话】，exe 若要求提升会报 740「需要提升」、注入失败。
+    uac_admin=False,
 )

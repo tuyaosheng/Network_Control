@@ -13,3 +13,6 @@ install_agent.log
 .vscode/
 .DS_Store
 Thumbs.db
+
+# 打包分发用的 zip（体积大，不入库）
+*.zip
