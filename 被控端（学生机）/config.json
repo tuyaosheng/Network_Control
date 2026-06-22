@@ -1,0 +1,7 @@
+{
+  "controller_url": "ws://192.168.1.100:8765",
+  "upstream_dns": "114.114.114.114",
+  "tray_visible": true,
+  "tray_password_hash": "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9",
+  "lan_subnets": ["192.168.1.0/24"]
+}

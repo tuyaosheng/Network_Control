@@ -1,0 +1,15 @@
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 运行时生成的日志 / 数据库（不应入库）
+*.log
+controller.db
+roster.db
+install_agent.log
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

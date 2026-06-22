@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>网段计算器 · network_control 配置助手</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Microsoft YaHei',sans-serif;background:linear-gradient(135deg,#0f2044,#1a3a5c,#0f4c75);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.card{background:#fff;border-radius:18px;padding:34px 32px;width:100%;max-width:520px;box-shadow:0 30px 80px rgba(0,0,0,.4)}
+h1{font-size:19px;color:#1a3a5c;text-align:center;margin-bottom:4px}
+.sub{font-size:12px;color:#64748b;text-align:center;margin-bottom:24px}
+label{display:block;font-size:13px;font-weight:600;color:#374151;margin:16px 0 6px}
+input{width:100%;padding:11px 14px;border:2px solid #e2e8f0;border-radius:9px;font-size:15px;color:#1e293b;outline:none;transition:.2s;font-family:Consolas,monospace}
+input:focus{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.15)}
+.hint{font-size:11px;color:#94a3b8;margin-top:4px}
+.btn{margin-top:22px;width:100%;padding:13px;background:#2563eb;color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;transition:.2s}
+.btn:hover{background:#1d4ed8}
+.err{margin-top:14px;font-size:13px;color:#dc2626;text-align:center;min-height:16px}
+.result{margin-top:22px;display:none}
+.result.show{display:block}
+.big{background:#0f172a;color:#34d399;border-radius:12px;padding:18px;text-align:center;font-family:Consolas,monospace;font-size:26px;font-weight:700;letter-spacing:1px;position:relative}
+.copy{position:absolute;top:10px;right:10px;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:7px;padding:5px 10px;font-size:12px;cursor:pointer;font-family:inherit}
+.copy:hover{background:#334155;color:#fff}
+.copy.ok{color:#34d399;border-color:#34d399}
+table{width:100%;border-collapse:collapse;margin-top:16px;font-size:13px}
+td{padding:7px 6px;border-bottom:1px solid #f1f5f9;color:#334155}
+td:first-child{color:#64748b;width:120px}
+td.mono{font-family:Consolas,monospace;font-weight:600;color:#1e293b}
+.tip{margin-top:18px;font-size:12px;color:#64748b;background:#f8fafc;border-left:3px solid #93c5fd;padding:10px 12px;border-radius:6px;line-height:1.7}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🖧 网段计算器</h1>
+  <div class="sub">输入教师机（或学生机）的 IP 与子网掩码，算出 <code>lan_subnets</code> 该填的网段</div>
+
+  <label>IP 地址</label>
+  <input id="ip" placeholder="例如 192.168.1.100" value="192.168.1.100" oninput="onInput()" onkeydown="if(event.key==='Enter')calc()">
+  <div class="hint">学生机 / 教师机上 <code>ipconfig</code> 里的 IPv4 地址</div>
+
+  <label>子网掩码</label>
+  <input id="mask" placeholder="例如 255.255.255.0 或直接写 24" value="255.255.255.0" oninput="onInput()" onkeydown="if(event.key==='Enter')calc()">
+  <div class="hint">点分十进制（255.255.255.0）或前缀长度（24 / /24）都可以</div>
+
+  <button class="btn" onclick="calc()">计算网段</button>
+  <div class="err" id="err"></div>
+
+  <div class="result" id="result">
+    <div class="big">
+      <span id="cidr">—</span>
+      <button class="copy" id="copyBtn" onclick="copyCidr()">复制</button>
+    </div>
+    <table>
+      <tr><td>网络号</td><td class="mono" id="net">—</td></tr>
+      <tr><td>前缀长度</td><td class="mono" id="prefix">—</td></tr>
+      <tr><td>可用主机数</td><td class="mono" id="hosts">—</td></tr>
+      <tr><td>地址范围</td><td class="mono" id="range">—</td></tr>
+      <tr><td>广播地址</td><td class="mono" id="bcast">—</td></tr>
+      <tr><td>常见网关(.1)</td><td class="mono" id="gw">—</td></tr>
+    </table>
+    <div class="tip">
+      把上面绿色的 <strong id="tipCidr">网段</strong> 填进：<br>
+      • 被控端 <code>config.json</code> 的 <code>"lan_subnets"</code>（数组，如 <code>["192.168.1.0/24"]</code>）<br>
+      • 主控端 GUI「设置」里的局域网段<br>
+      <strong>注意：</strong>填的是网络号，不是网关 .1，也不是某台机器的具体 IP。
+    </div>
+  </div>
+</div>
+
+<script>
+function onInput(){ document.getElementById('err').textContent=''; }
+
+function parseIp(s){
+  const m = s.trim().split('.');
+  if(m.length!==4) return null;
+  const arr = m.map(x=>{
+    if(!/^\d+$/.test(x)) return NaN;
+    const n = parseInt(x,10);
+    return (n>=0 && n<=255) ? n : NaN;
+  });
+  return arr.some(isNaN) ? null : arr;
+}
+
+// 掩码可填 255.255.255.0，也可填 24 或 /24
+function parseMask(s){
+  s = s.trim().replace(/^\//,'');
+  if(/^\d+$/.test(s)){                 // 前缀长度
+    const p = parseInt(s,10);
+    if(p<0 || p>32) return null;
+    return {prefix:p, octets:prefixToOctets(p)};
+  }
+  const oct = parseIp(s);              // 点分十进制
+  if(!oct) return null;
+  // 校验是连续的 1 后跟连续的 0
+  let bits = oct.map(o=>o.toString(2).padStart(8,'0')).join('');
+  if(!/^1*0*$/.test(bits)) return null;
+  const prefix = (bits.match(/1/g)||[]).length;
+  return {prefix, octets:oct};
+}
+
+function prefixToOctets(p){
+  let bits = '1'.repeat(p) + '0'.repeat(32-p);
+  return [0,1,2,3].map(i=>parseInt(bits.slice(i*8,i*8+8),2));
+}
+
+function calc(){
+  const err = document.getElementById('err');
+  const ip = parseIp(document.getElementById('ip').value);
+  if(!ip){ err.textContent='IP 地址格式不对，应为 4 段 0-255，如 192.168.1.100'; return; }
+  const mask = parseMask(document.getElementById('mask').value);
+  if(!mask){ err.textContent='子网掩码不对，请填 255.255.255.0 这种，或前缀如 24'; return; }
+
+  const net   = ip.map((o,i)=>o & mask.octets[i]);
+  const bcast = ip.map((o,i)=>o | (255 ^ mask.octets[i]));
+  const cidr  = net.join('.') + '/' + mask.prefix;
+
+  document.getElementById('cidr').textContent = cidr;
+  document.getElementById('tipCidr').textContent = cidr;
+  document.getElementById('net').textContent = net.join('.');
+  document.getElementById('prefix').textContent = '/' + mask.prefix + '（掩码 ' + mask.octets.join('.') + '）';
+
+  const hostBits = 32 - mask.prefix;
+  if(hostBits<=1){
+    document.getElementById('hosts').textContent = (hostBits===1?'2（点对点）':'1（单机)');
+    document.getElementById('range').textContent = net.join('.') + (hostBits===1? ' ~ '+bcast.join('.') : '');
+  }else{
+    const total = Math.pow(2,hostBits);
+    const first = [...net]; first[3]+=1;          // 注意：仅在 /24 类常见情况直观
+    document.getElementById('hosts').textContent = (total-2).toLocaleString() + ' 台';
+    document.getElementById('range').textContent = incIp(net) + ' ~ ' + decIp(bcast);
+  }
+  document.getElementById('bcast').textContent = bcast.join('.');
+  document.getElementById('gw').textContent = incIp(net) + '（实际网关以 ipconfig 为准）';
+
+  document.getElementById('result').className = 'result show';
+  document.getElementById('copyBtn').className = 'copy';
+  document.getElementById('copyBtn').textContent = '复制';
+}
+
+// 32 位整数加减，处理跨段进位
+function toInt(a){ return ((a[0]<<24)>>>0)+(a[1]<<16)+(a[2]<<8)+a[3]; }
+function toArr(n){ return [(n>>>24)&255,(n>>>16)&255,(n>>>8)&255,n&255]; }
+function incIp(a){ return toArr((toInt(a)+1)>>>0).join('.'); }
+function decIp(a){ return toArr((toInt(a)-1)>>>0).join('.'); }
+
+function copyCidr(){
+  const t = document.getElementById('cidr').textContent;
+  navigator.clipboard.writeText(t).then(()=>{
+    const b=document.getElementById('copyBtn'); b.textContent='已复制 ✓'; b.className='copy ok';
+  }).catch(()=>{
+    const r=document.createRange(); r.selectNode(document.getElementById('cidr'));
+    getSelection().removeAllRanges(); getSelection().addRange(r);
+    document.execCommand('copy'); getSelection().removeAllRanges();
+    const b=document.getElementById('copyBtn'); b.textContent='已复制 ✓'; b.className='copy ok';
+  });
+}
+
+calc();
+</script>
+</body>
+</html>
