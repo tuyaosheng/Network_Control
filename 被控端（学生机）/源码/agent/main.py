@@ -244,7 +244,8 @@ class AgentCore:
                     self._lock_screen_pid = self._launch_lock_screen()
                 elif up and not self._network_was_up:
                     self._network_was_up = True
-                    logger.info("网络已恢复")
+                    logger.info("网络已恢复，关闭锁屏")
+                    self._close_lock_screen()
 
                 # 网线仍断开但锁屏进程已退出：重启锁屏
                 if not self._network_was_up and self._lock_screen_pid:
@@ -266,6 +267,27 @@ class AgentCore:
             return int(s) > 0 if s.isdigit() else True
         except Exception:
             return True
+
+    def _close_lock_screen(self):
+        """网络恢复时由 agent 主动关闭锁屏进程（比锁屏自检测更可靠，跨会话强杀）。"""
+        pid = self._lock_screen_pid
+        self._lock_screen_pid = None
+        if not pid:
+            return
+        try:
+            import win32api, win32con, win32process
+            h = win32api.OpenProcess(win32con.PROCESS_TERMINATE, False, pid)
+            win32process.TerminateProcess(h, 0)
+            win32api.CloseHandle(h)
+            logger.info(f"已关闭锁屏进程 PID={pid}")
+        except Exception as e:
+            logger.warning(f"OpenProcess/Terminate 关闭锁屏失败({e})，改用 taskkill")
+            try:
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                               capture_output=True,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+            except Exception as e2:
+                logger.warning(f"taskkill 关闭锁屏也失败 PID={pid}: {e2}")
 
     def _launch_lock_screen(self) -> int | None:
         unlock_hash = self.config.get("unlock_password_hash",
