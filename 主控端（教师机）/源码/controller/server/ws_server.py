@@ -177,9 +177,12 @@ class ControllerServer:
             agent.mac      = msg.get("mac", "")
             logger.info(f"注册: {agent.ip} ({agent.hostname})")
             self._notify_change()
-            # 若断开前不是正常状态，重连后自动恢复（还原卡场景）
-            if agent.net_state != "normal" and self._on_agent_reconnect:
-                asyncio.create_task(self._on_agent_reconnect(agent.ip, agent.net_state))
+            # 被控端开机默认断网（fail-closed），注册时按【老师设过的权威状态】下发，含 normal=放行。
+            # 必须用 _saved_states（老师意图），不能用 agent.net_state——后者会被"开机临时断网"的
+            # 自报污染，导致每次开机都被误判为断网、即使老师从没设过断网也开不了网。
+            if self._on_agent_reconnect:
+                authoritative = self._saved_states.get(agent.ip, "normal")
+                asyncio.create_task(self._on_agent_reconnect(agent.ip, authoritative))
 
         elif t in (MSG_HEARTBEAT, MSG_STATUS):
             agent.filter_active = msg.get("filter_active", False)

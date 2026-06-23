@@ -294,13 +294,31 @@ def _delete_default_route() -> bool:
     return ok
 
 
-def disconnect_internet() -> bool:
+def disconnect_internet(controller_ip: str = "") -> bool:
     """
     彻底断网（用于状态切换：→ disconnect / → blacklist / → normal 前）：
     清理 whitelist 主机路由 + 删除默认路由。
+    若给了 controller_ip，则删默认路由【之前】先给主控端加一条 /32 主机路由（经原网关），
+    保证断网后被控端仍能连回主控端、接收"放行"等指令（尤其主控端在另一网段时）。
     """
+    global _whitelist_host_routes
     _clean_whitelist_routes()   # 状态切换时才清理白名单路由
+    if controller_ip:
+        gws = _get_default_gateways()
+        if gws:
+            gw     = gws[0]
+            gw_ip  = gw.get("NextHop", "")
+            gw_idx = gw.get("InterfaceIndex", 0)
+            if gw_ip and gw_ip not in ("0.0.0.0", "::", ""):
+                added = _add_host_routes_bulk([controller_ip], gw_ip, gw_idx)
+                _whitelist_host_routes |= added  # 记录，下次状态切换时清理
+                logger.info(f"断网保留主控端路由: {controller_ip} 经 {gw_ip}")
     return _delete_default_route()
+
+
+def has_internet_route() -> bool:
+    """当前是否存在默认路由（开机时用于判断网络栈/DHCP 是否就绪）。"""
+    return bool(_get_default_gateways())
 
 
 def reconnect_internet() -> bool:

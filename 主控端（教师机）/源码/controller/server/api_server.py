@@ -25,24 +25,27 @@ class ControlAPIServer:
         host:       监听地址，默认 127.0.0.1（仅本机调用）。需局域网其他机器调用改 0.0.0.0。
         port:       监听端口，默认 8770。
         token:      访问令牌，非空时所有写操作需携带（Header 或 query），空则不校验。
-        on_enable:    开网回调（无参），线程安全（内部应只 emit 信号）。
-        on_disable:   禁网回调（无参），同上。
-        on_enable_ip: 按 IP 开单台回调（参数为 IP 字符串），同上。供学习平台使用。
-        get_status:   返回状态的回调，返回可 JSON 序列化对象（如被控端列表）。
+        on_enable:     开网回调（无参），线程安全（内部应只 emit 信号）。
+        on_disable:    禁网回调（无参），同上。
+        on_enable_ip:  按 IP 开单台回调（参数为 IP 字符串），同上。供学习平台使用。
+        on_disable_ip: 按 IP 禁单台回调（参数为 IP 字符串），同上。供学习平台同步状态使用。
+        get_status:    返回状态的回调，返回可 JSON 序列化对象（如被控端列表）。
     """
 
     def __init__(self, host: str = "127.0.0.1", port: int = 8770, token: str = "",
                  on_enable: Optional[Callable[[], None]] = None,
                  on_disable: Optional[Callable[[], None]] = None,
                  on_enable_ip: Optional[Callable[[str], None]] = None,
+                 on_disable_ip: Optional[Callable[[str], None]] = None,
                  get_status: Optional[Callable[[], object]] = None):
-        self.host         = host
-        self.port         = port
-        self.token        = token
-        self.on_enable    = on_enable
-        self.on_disable   = on_disable
-        self.on_enable_ip = on_enable_ip
-        self.get_status   = get_status
+        self.host          = host
+        self.port          = port
+        self.token         = token
+        self.on_enable     = on_enable
+        self.on_disable    = on_disable
+        self.on_enable_ip  = on_enable_ip
+        self.on_disable_ip = on_disable_ip
+        self.get_status    = get_status
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread]   = None
 
@@ -140,6 +143,18 @@ class ControlAPIServer:
                         outer.on_enable_ip(ip)
                     self._send(202, {"ok": True, "action": "enable_ip", "ip": ip,
                                      "message": f"已下发『允许上网』指令: {ip}"})
+                    return
+
+                # 按 IP 禁单台（供学习平台：手动同步未完成学生的禁网状态）
+                if path in ("/api/network/disable_ip", "/api/disable_ip", "/disable_ip"):
+                    ip = (query.get("ip", [""])[0] or "").strip()
+                    if not ip:
+                        self._send(400, {"ok": False, "error": "missing ip"})
+                        return
+                    if outer.on_disable_ip:
+                        outer.on_disable_ip(ip)
+                    self._send(202, {"ok": True, "action": "disable_ip", "ip": ip,
+                                     "message": f"已下发『禁止上网』指令: {ip}"})
                     return
 
                 self._send(404, {"ok": False, "error": "not found", "path": path})

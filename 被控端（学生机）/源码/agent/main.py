@@ -22,7 +22,7 @@ from agent.filter.firewall import (
     apply_whitelist_routing, remove_all_rules,
     set_adapter_dns,
     disconnect_internet, reconnect_internet,
-    add_host_routes_dynamic,
+    add_host_routes_dynamic, has_internet_route,
 )
 from agent.client.ws_client import AgentWSClient
 from agent.tray.tray_icon import AgentTray
@@ -78,7 +78,8 @@ class AgentCore:
         self._whitelist_domains: list[str] = []
         self._blacklist_domains: list[str] = []
         self._lan_subnets: list[str] = self.config.get("lan_subnets", [])
-        self._controller_ip: str = ""
+        # 开机阶段（主控端还没下发前）就从 config 解析主控端 IP，供"断网保留主控端路由"用
+        self._controller_ip: str = self._parse_controller_ip()
         self._upstream_dns: str = self.config.get("upstream_dns", "114.114.114.114")
         # 浏览记录（DNS 查询日志）
         self._recent_domains: collections.deque = collections.deque(maxlen=50)
@@ -192,7 +193,8 @@ class AgentCore:
         self._stop_dns()
         set_adapter_dns(self._upstream_dns)
         remove_all_rules()       # 清掉白名单模式可能留下的防火墙规则
-        disconnect_internet()    # 删除默认网关路由，彻底断网、局域网保留
+        # 传主控端 IP：删默认路由前先保留到主控端的路由，断网后仍能被主控端管理/放行
+        disconnect_internet(self._controller_ip)
 
     def _do_restore(self):
         self._stop_dns()
@@ -269,25 +271,22 @@ class AgentCore:
             return True
 
     def _close_lock_screen(self):
-        """网络恢复时由 agent 主动关闭锁屏进程（比锁屏自检测更可靠，跨会话强杀）。"""
-        pid = self._lock_screen_pid
+        """网络恢复时关闭【全部】锁屏进程。
+        被控端是 PyInstaller 单文件 exe，--lock 会有 bootstrap 父进程 + GUI 子进程，
+        且偶发重启可能产生多套锁屏；只杀单个 PID 关不掉真正显示蓝屏的子进程。
+        所以这里按命令行匹配 --lock，把父/子/重复的锁屏进程一并杀掉（最可靠）。"""
         self._lock_screen_pid = None
-        if not pid:
-            return
+        # 排除当前这条 PowerShell 自己（它的命令行里也含 --lock 文本）
+        ps = ("Get-CimInstance Win32_Process | Where-Object "
+              "{ $_.CommandLine -like '*--lock*' -and $_.ProcessId -ne $PID } | "
+              "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }")
         try:
-            import win32api, win32con, win32process
-            h = win32api.OpenProcess(win32con.PROCESS_TERMINATE, False, pid)
-            win32process.TerminateProcess(h, 0)
-            win32api.CloseHandle(h)
-            logger.info(f"已关闭锁屏进程 PID={pid}")
+            subprocess.run(['powershell', '-NonInteractive', '-Command', ps],
+                           capture_output=True, timeout=15,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+            logger.info("已关闭全部锁屏进程(--lock)")
         except Exception as e:
-            logger.warning(f"OpenProcess/Terminate 关闭锁屏失败({e})，改用 taskkill")
-            try:
-                subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                               capture_output=True,
-                               creationflags=subprocess.CREATE_NO_WINDOW)
-            except Exception as e2:
-                logger.warning(f"taskkill 关闭锁屏也失败 PID={pid}: {e2}")
+            logger.warning(f"关闭锁屏进程失败: {e}")
 
     def _launch_lock_screen(self) -> int | None:
         unlock_hash = self.config.get("unlock_password_hash",
@@ -372,6 +371,33 @@ class AgentCore:
         self._do_restore()
         os._exit(0)
 
+    # ── 开机默认断网（fail-closed） ───────────────────────────────
+
+    def _parse_controller_ip(self) -> str:
+        """从 controller_url 解析主控端 IP（仅当是 IP 时返回，是域名则返回空——断网下无法 DNS 解析）。"""
+        import re, ipaddress
+        url = self.config.get("controller_url", "")
+        m = re.match(r'wss?://([^:/]+)', url)
+        host = m.group(1) if m else ""
+        try:
+            ipaddress.ip_address(host)
+            return host
+        except ValueError:
+            return ""
+
+    def _boot_lockdown(self):
+        """开机先断网（保留到主控端的路由），等连上主控端、收到上次状态后再更新。"""
+        import time
+        # 等网卡/默认路由就绪（DHCP 可能稍慢），最多约 10 秒
+        for _ in range(5):
+            if has_internet_route():
+                break
+            time.sleep(2)
+        if not self._controller_ip:
+            logger.warning("controller_url 不是 IP，无法保留主控端路由，断网可能连不回主控端")
+        logger.info("开机默认断网（fail-closed），等待主控端下发上次状态")
+        self._set_state(self.STATE_DISCONNECT)
+
     # ── 主循环 ───────────────────────────────────────────────────
 
     async def run(self):
@@ -384,6 +410,9 @@ class AgentCore:
             on_exit_confirmed=self._on_exit_confirmed
         )
         self.tray.start()
+
+        # 开机即锁网：默认断网，连上主控端后由主控端下发权威状态再放开/调整
+        self._boot_lockdown()
 
         self.ws_client = AgentWSClient(
             controller_url=self.config["controller_url"],

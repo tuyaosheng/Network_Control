@@ -75,11 +75,12 @@ def _configure_failure_recovery():
         "reset=", "86400",
         "actions=", "restart/30000/restart/30000/restart/30000"
     ], capture_output=True)
-    # 改为延迟自启：等登录会话就绪后再启动，彻底避免开机时抢先于桌面/网络
+    # 立即自启（auto）：开机随其它自启服务一起启动，配合服务依赖 Tcpip/Dnscache，
+    # 网络栈就绪即启，消除开机 1~2 分钟空挡（被控端启动后会立刻默认断网锁住）。
     subprocess.run([
-        "sc", "config", SERVICE_NAME, "start=", "delayed-auto"
+        "sc", "config", SERVICE_NAME, "start=", "auto"
     ], capture_output=True)
-    print("已配置失败自动重启策略 + 延迟自启（delayed-auto）")
+    print("已配置失败自动重启策略 + 开机立即自启（auto）")
 
 
 if __name__ == "__main__":

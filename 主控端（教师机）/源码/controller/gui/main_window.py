@@ -47,6 +47,7 @@ class Signals(QObject):
     api_enable     = pyqtSignal()
     api_disable    = pyqtSignal()
     api_enable_ip  = pyqtSignal(str)   # 按 IP 开单台（学习平台调用）
+    api_disable_ip = pyqtSignal(str)   # 按 IP 禁单台（学习平台同步状态调用）
 
 
 class MainWindow(QMainWindow):
@@ -83,6 +84,7 @@ class MainWindow(QMainWindow):
         self._signals.api_enable.connect(self._on_api_enable)
         self._signals.api_disable.connect(self._on_api_disable)
         self._signals.api_enable_ip.connect(self._on_api_enable_ip)
+        self._signals.api_disable_ip.connect(self._on_api_disable_ip)
 
     # ── UI 构建 ───────────────────────────────────────────────────
 
@@ -238,6 +240,7 @@ class MainWindow(QMainWindow):
                 on_enable=self._signals.api_enable.emit,
                 on_disable=self._signals.api_disable.emit,
                 on_enable_ip=self._signals.api_enable_ip.emit,
+                on_disable_ip=self._signals.api_disable_ip.emit,
                 get_status=self.server.get_agents,
             )
             self._api_server.start()
@@ -263,6 +266,11 @@ class MainWindow(QMainWindow):
         """外部接口（学习平台）触发的『按 IP 开网』，等价于对该机器点击「允许上网」。"""
         self._append_log(f"[API] 收到『开网』请求: {ip}")
         self._on_allow_all([ip])
+
+    def _on_api_disable_ip(self, ip: str):
+        """外部接口（学习平台）触发的『按 IP 禁网』，等价于对该机器点击「禁止上网」。"""
+        self._append_log(f"[API] 收到『禁网』请求: {ip}")
+        self._on_disconnect([ip])
 
     def _on_agent_change(self):
         self._signals.agents_changed.emit()
@@ -292,6 +300,9 @@ class MainWindow(QMainWindow):
                 await self.server.set_filter(True, MODE_BLACKLIST, ip)
         elif state == "disconnect":
             await self.server.disconnect_internet(ip)
+        else:
+            # normal 或未知：明确放行（被控端开机默认断网，需主控端确认才上网）
+            await self.server.reconnect_internet(ip)
         self._signals.log_msg.emit(f"[重连恢复] {ip} 已重新应用状态: {state}")
 
     def _refresh_machines(self):
