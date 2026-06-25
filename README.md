@@ -35,7 +35,7 @@
 │   └── 源码/                   controller/ + shared/ + 打包脚本 + 技术手册.md
 │
 └── 被控端（学生机）/
-    ├── 被控端.exe              打包程序（安装为 Windows 服务）
+    ├── CTR.exe                 打包程序（安装为 Windows 服务）
     ├── config.json             默认配置文件（部署前改 controller_url 为教师机 IP）
     ├── install_agent.bat       安装脚本（自动提权 + 装服务 + 写日志）
     ├── uninstall_agent.bat     卸载脚本
@@ -80,11 +80,11 @@
    ```json
    { "controller_url": "ws://192.168.1.100:8765", ... }
    ```
-2. 把 `被控端.exe`、`config.json`、`install_agent.bat` **放进学生机本地同一文件夹**（先解压，别在压缩包里直接跑）。
+2. 把 `CTR.exe`、`config.json`、`install_agent.bat` **放进学生机本地同一文件夹**（先解压，别在压缩包里直接跑）。
 3. **管理员**身份运行 `install_agent.bat`（脚本会自动申请 UAC）。它会：装服务 → 启动 → 写 `install_agent.log`。
 4. 验证：学生机执行 `sc query NetControlAgent`，看到 `STATE: 4 RUNNING`；再到主控端面板看到这台机器上线即成功。
 
-> 卸载：运行 `uninstall_agent.bat`，或管理员 `被控端.exe remove`。
+> 卸载：运行 `uninstall_agent.bat`，或管理员 `CTR.exe remove`。
 
 ---
 
@@ -171,7 +171,7 @@ pip install -r requirements.txt
 build_controller.bat        :: → dist\主控端.exe
 
 :: 被控端
-build_agent.bat             :: → dist\被控端.exe + config.json
+build_agent.bat             :: → dist\CTR.exe + config.json
 ```
 
 调试运行（不打包）：`run_controller.bat` / `run_agent_debug.bat`（被控端需管理员）。
@@ -184,7 +184,7 @@ build_agent.bat             :: → dist\被控端.exe + config.json
 
 ## ❓ 常见问题
 
-- **服务列表里找不到？** 用 `sc query NetControlAgent` 确认；服务显示名是中文「网络控制-被控端」。多半是安装时 UAC 没点「是」，导致没真正安装——用管理员终端跑 `被控端.exe install` 看报错。
+- **服务列表里找不到？** 用 `sc query NetControlAgent` 确认；服务显示名是中文「网络控制-被控端」。多半是安装时 UAC 没点「是」，导致没真正安装——用管理员终端跑 `CTR.exe install` 看报错。
 - **学生机连不上主控端？** 检查 `config.json` 的 `controller_url`（IP/端口）、教师机防火墙是否放行 8765、两端是否同网段。
 - **白名单放行了但仍打不开网站？** 该网站可能用了未在白名单中的第三方域名（CDN/接口域名），需一并加入。
 - **bat 双击乱码？** 本仓库 bat 已用 GBK 编码，适配中文 Windows；若自己改动请保持 GBK 保存。

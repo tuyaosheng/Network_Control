@@ -1,9 +1,9 @@
 """
 Windows 服务包装器 - 以 SYSTEM 权限运行被控端
-安装: 被控端.exe install
-启动: 被控端.exe start
-卸载: 被控端.exe remove
-锁屏: 被控端.exe --lock <hash>
+安装: CTR.exe install
+启动: CTR.exe start
+卸载: CTR.exe remove
+锁屏: CTR.exe --lock <hash>
 """
 import sys
 import os
@@ -84,7 +84,7 @@ def _configure_failure_recovery():
 
 
 if __name__ == "__main__":
-    # 锁屏模式：被控端.exe --lock <hash>
+    # 锁屏模式：CTR.exe --lock <hash>
     if len(sys.argv) >= 2 and sys.argv[1] == "--lock":
         hash_val = (sys.argv[2] if len(sys.argv) > 2
                     else hashlib.sha256(b"admin123").hexdigest())
