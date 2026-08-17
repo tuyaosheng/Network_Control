@@ -22,15 +22,53 @@ RULE_PREFIX = "NC_"   # 所有规则名称前缀，便于批量清理
 
 
 def _run_ps(cmd: str, timeout: int = 15) -> tuple[bool, str]:
-    result = subprocess.run(
-        ["powershell", "-NonInteractive", "-Command", cmd],
-        capture_output=True, text=True, timeout=timeout
-    )
+    """执行一条 PowerShell 命令。绝不抛异常——本函数在状态机 dispatch 链路上，
+    一旦异常穿透，_set_state() 会在「状态已改、动作没做」的半途中断，
+    被控端会向主控端汇报一个它其实并没有进入的状态。"""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NonInteractive", "-Command", cmd],
+            capture_output=True, text=True, timeout=timeout
+        )
+    except Exception as e:
+        # 典型：命令行超过 CreateProcessW 的 32767 字符上限 → WinError 206
+        #      或 PowerShell 卡死触发 TimeoutExpired
+        logger.error(f"PS命令执行失败: {type(e).__name__}: {e} | 长度={len(cmd)} | {cmd[:160]}")
+        return False, str(e)
     ok = result.returncode == 0
     out = (result.stdout + result.stderr).strip()
     if not ok:
         logger.debug(f"PS命令失败: {cmd[:200]}\n{out}")
     return ok, out
+
+
+# CreateProcessW 的 lpCommandLine 上限是 32767 字符，超过会抛 WinError 206。
+# 留出 "powershell -NonInteractive -Command " 前缀和安全余量。
+_PS_CMDLINE_LIMIT = 28000
+
+
+def _run_ps_batched(parts: list[str], timeout: int = 60) -> str:
+    """把若干条独立的 PS 语句按命令行长度上限分批执行，返回各批输出拼接的结果。
+
+    白名单模式下 _whitelist_host_routes 会随 DNS 查询不断累积（一节课几百个 CDN IP），
+    早期实现把它们拼成【一条】命令，约 275 个 IP 就会超限并抛异常。
+    """
+    outs: list[str] = []
+    batch: list[str] = []
+    blen = 0
+    for p in parts:
+        if batch and blen + len(p) + 1 > _PS_CMDLINE_LIMIT:
+            _, out = _run_ps(" ".join(batch), timeout=timeout)
+            outs.append(out or "")
+            batch, blen = [], 0
+        batch.append(p)
+        blen += len(p) + 1
+    if batch:
+        _, out = _run_ps(" ".join(batch), timeout=timeout)
+        outs.append(out or "")
+    if len(outs) > 1:
+        logger.debug(f"批量 PS 命令分 {len(outs)} 批执行（共 {len(parts)} 条语句）")
+    return "\n".join(outs)
 
 
 def _ps_addr(addr: str) -> str:
@@ -217,6 +255,47 @@ def _ps_metric_arg(metric) -> str:
 _whitelist_host_routes: set[str] = set()   # 记录已添加的白名单主机路由，用于清理
 _cached_gateway: tuple[str, int] = ("", 0)  # 白名单模式下默认路由被删后用于动态添加主机路由的网关
 _dynamic_routes_lock = threading.Lock()     # 保护并发写路由表
+_onlink_nets: list = []                     # 本机直连（on-link）网段，见 _refresh_onlink_nets()
+
+
+def _refresh_onlink_nets() -> list:
+    """刷新本机各网卡的直连网段，用于判断某 IP 是否 on-link。
+
+    为什么需要：给一个【与本机同网段】的 IP 添加 "/32 经网关" 的主机路由是错的——
+    /32 比 on-link 的 /24 更具体会抢赢，导致本该二层直达的包被拐给网关，
+    而网关收到"目标就在来源网段内"的包通常直接丢弃（VMware NAT 实测必丢，
+    真实路由器多数会 hairpin 但不保证）。典型受害场景：主控端和被控端在同一
+    局域网（机房标准部署），开机 fail-closed 断网后被控端永远连不回主控端。
+    """
+    global _onlink_nets
+    cmd = ('Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue '
+           '| Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*" } '
+           '| Select-Object IPAddress, PrefixLength | ConvertTo-Json -Compress')
+    ok, out = _run_ps(cmd)
+    nets = []
+    if ok and out.strip():
+        try:
+            data = json.loads(out)
+            if isinstance(data, dict):
+                data = [data]
+            for d in data:
+                ip, pl = d.get("IPAddress"), d.get("PrefixLength")
+                if ip and pl:
+                    nets.append(ipaddress.ip_network(f"{ip}/{pl}", strict=False))
+        except Exception as e:
+            logger.debug(f"解析本机网段失败: {e} raw={out[:160]}")
+    _onlink_nets = nets
+    logger.info(f"本机直连网段: {[str(n) for n in nets] or '（无）'}")
+    return nets
+
+
+def _is_onlink(ip: str) -> bool:
+    """IP 是否与本机某张网卡同网段（同网段无需主机路由，删默认路由也影响不到它）。"""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in _onlink_nets)
 
 
 def _clean_whitelist_routes():
@@ -230,13 +309,12 @@ def _clean_whitelist_routes():
         _whitelist_host_routes.clear()
         _cached_gateway = ("", 0)
 
-    # 批量删除，避免一次开几百个 PowerShell 进程
+    # 批量删除，避免一次开几百个 PowerShell 进程；按命令行长度上限自动分批
     parts = [
         f'try {{ Remove-NetRoute -DestinationPrefix "{ip}/32" -Confirm:$false -ErrorAction SilentlyContinue }} catch {{}};'
         for ip in ips
     ]
-    script = " ".join(parts)
-    _run_ps(script, timeout=60)
+    _run_ps_batched(parts, timeout=60)
     logger.debug(f"已清除 {len(ips)} 条白名单主机路由")
 
 
@@ -304,15 +382,20 @@ def disconnect_internet(controller_ip: str = "") -> bool:
     global _whitelist_host_routes
     _clean_whitelist_routes()   # 状态切换时才清理白名单路由
     if controller_ip:
+        _refresh_onlink_nets()  # 主控端若与本机同网段，下面会跳过加主机路由
         gws = _get_default_gateways()
         if gws:
             gw     = gws[0]
             gw_ip  = gw.get("NextHop", "")
             gw_idx = gw.get("InterfaceIndex", 0)
             if gw_ip and gw_ip not in ("0.0.0.0", "::", ""):
-                added = _add_host_routes_bulk([controller_ip], gw_ip, gw_idx)
-                _whitelist_host_routes |= added  # 记录，下次状态切换时清理
-                logger.info(f"断网保留主控端路由: {controller_ip} 经 {gw_ip}")
+                if _is_onlink(controller_ip):
+                    # 同网段：on-link 子网路由本来就在，删默认路由影响不到它，无需也不能加主机路由
+                    logger.info(f"主控端 {controller_ip} 与本机同网段，断网后靠 on-link 直达，无需保留路由")
+                else:
+                    added = _add_host_routes_bulk([controller_ip], gw_ip, gw_idx)
+                    _whitelist_host_routes |= added  # 记录，下次状态切换时清理
+                    logger.info(f"断网保留主控端路由: {controller_ip} 经 {gw_ip}")
     return _delete_default_route()
 
 
@@ -435,6 +518,9 @@ def apply_whitelist_routing(whitelist_domains: list[str],
     # ── Phase 2: 加基线主机路由（DNS 转发需要能连上游 DNS） ──────────
     set_adapter_dns("127.0.0.1")
 
+    # 刷新 on-link 网段：同网段的主控端/DNS 不能按网关加主机路由（会不通）
+    _refresh_onlink_nets()
+
     baseline: set[str] = set()
     if upstream_dns:
         baseline.add(upstream_dns)
@@ -458,10 +544,24 @@ def apply_whitelist_routing(whitelist_domains: list[str],
 
 
 def _add_host_routes_bulk(ips: list[str], gw_ip: str, gw_idx: int) -> set[str]:
-    """批量添加 /32 主机路由（一次 PS 调用，减少总耗时）。"""
+    """批量添加 /32 主机路由（尽量少的 PS 调用，减少总耗时）。
+
+    与本机同网段（on-link）的 IP 会被跳过：它们靠 on-link 子网路由就能直达，
+    强行加 "/32 经网关" 反而会把包拐给网关导致不通（见 _refresh_onlink_nets 注释）。
+    这些 IP 仍算作"已处理"返回，避免调用方反复重试。
+    """
     if not ips:
         return set()
-    # 构造一条 PowerShell 脚本，包含所有 Remove+New 操作
+
+    onlink = [ip for ip in ips if _is_onlink(ip)]
+    if onlink:
+        logger.info(f"跳过 {len(onlink)} 个同网段 IP（on-link 直达，无需主机路由）: "
+                    f"{onlink[:5]}{'...' if len(onlink) > 5 else ''}")
+        ips = [ip for ip in ips if not _is_onlink(ip)]
+        if not ips:
+            return set(onlink)
+
+    # 构造 PowerShell 语句列表，包含所有 Remove+New 操作
     parts = []
     for ip in ips:
         parts.append(
@@ -470,9 +570,8 @@ def _add_host_routes_bulk(ips: list[str], gw_ip: str, gw_idx: int) -> set[str]:
             f'-InterfaceIndex {gw_idx} -RouteMetric 1 -ErrorAction Stop | Out-Null; '
             f'Write-Output "OK {ip}" }} catch {{ Write-Output "FAIL {ip} $($_.Exception.Message)" }};'
         )
-    script = " ".join(parts)
-    # 一次最多处理几百条路由，给充足超时
-    ok, out = _run_ps(script, timeout=120)
+    # 按命令行长度上限自动分批（每条语句约 368 字符，单批上限约 76 个 IP）
+    out = _run_ps_batched(parts, timeout=120)
     added: set[str] = set()
     for line in (out or "").splitlines():
         line = line.strip()
@@ -480,7 +579,7 @@ def _add_host_routes_bulk(ips: list[str], gw_ip: str, gw_idx: int) -> set[str]:
             added.add(line[3:].strip())
         elif line.startswith("FAIL "):
             logger.warning(f"主机路由失败: {line[5:][:120]}")
-    return added
+    return added | set(onlink)
 
 
 def set_adapter_dns(dns_ip: str = "127.0.0.1"):

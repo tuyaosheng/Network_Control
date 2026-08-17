@@ -21,12 +21,17 @@ if not exist "CTR.exe" (
     echo 请把 CTR.exe  config.json  install_agent.bat 放在同一个文件夹，
     echo 并先把压缩包整体解压再运行。
     echo.
-    timeout /t 20
+    rem timeout 需要控制台，批量部署时会挂死；用 ping 代替延时
+ping -n 21 127.0.0.1 >nul
     exit /b 1
 )
 
 echo 正在安装 CTR 服务，请稍候...
-CTR.exe stop   >> "%LOG%" 2>&1
+rem 升级场景：旧版可能正处于断网/白名单状态，停止时要等它把默认路由加回来再 remove。
+rem --wait 必须写在 stop 前面（pywin32 用 getopt 解析，遇到第一个非选项参数即停止）。
+rem 先解除旧版的失败自动重启策略，否则旧服务可能在 remove 后被 SCM 拉起来。
+sc failure NetControlAgent reset= 0 actions= "" >> "%LOG%" 2>&1
+CTR.exe --wait 40 stop >> "%LOG%" 2>&1
 CTR.exe remove >> "%LOG%" 2>&1
 CTR.exe install >> "%LOG%" 2>&1
 CTR.exe start   >> "%LOG%" 2>&1
@@ -42,4 +47,5 @@ echo.
 sc query NetControlAgent | findstr /i "RUNNING" >nul && echo 结果: 安装成功 服务 RUNNING || echo 结果: 未运行，请看上方日志
 echo.
 echo 窗口 20 秒后自动关闭，也可按任意键关闭
-timeout /t 20
+rem timeout 需要控制台，批量部署时会挂死；用 ping 代替延时
+ping -n 21 127.0.0.1 >nul

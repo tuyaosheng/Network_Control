@@ -1,6 +1,12 @@
+# 主控端 + 被控端 公用
 dnslib>=0.9.23
 websockets>=12.0,<13.0
 PyQt6>=6.6.0
 pywin32>=306
 pystray>=0.19.5
 Pillow>=10.0.0
+
+# 仅主控端需要：controller/dep_discover.py 的「白名单自动发现依赖」功能。
+# 该模块被 rule_panel.py 在模块级 import，缺失会导致主控端启动直接 ImportError。
+requests>=2.31.0
+beautifulsoup4>=4.12.0

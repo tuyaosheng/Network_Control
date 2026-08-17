@@ -78,21 +78,62 @@ class ControlAPIServer:
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
-                self.send_header("Access-Control-Allow-Origin", "*")
+                # 不再下发 Access-Control-Allow-Origin: *
+                # 否则任意网页都能跨源读取 /api/status（全班 IP / 主机名 / 浏览记录）
                 self.end_headers()
                 self.wfile.write(body)
 
             def _authorized(self, query: dict) -> bool:
                 if not outer.token:
                     return True
+                if self._token_in_header():
+                    return True
+                if query.get("token", [""])[0] == outer.token:
+                    return True
+                return False
+
+            def _token_in_header(self) -> bool:
+                """令牌是否通过请求头提供。<img>/<form> 这类 CSRF 载体无法设置自定义头，
+                因此「头里带对令牌」可以直接认定不是 CSRF。query 里的令牌不算。"""
+                if not outer.token:
+                    return False
                 auth = self.headers.get("Authorization", "")
                 if auth.startswith("Bearer ") and auth[7:].strip() == outer.token:
                     return True
                 if self.headers.get("X-API-Token", "").strip() == outer.token:
                     return True
-                if query.get("token", [""])[0] == outer.token:
-                    return True
                 return False
+
+            def _csrf_reason(self) -> str:
+                """识别「浏览器发起的跨站请求」——CSRF 的必要特征。返回拦截原因，空串表示放行。
+
+                背景：接口默认无令牌且绑 127.0.0.1，但绑本机挡不住 CSRF——请求正是从老师
+                自己的浏览器发出的。老师只要打开一个恶意网页，页面里一行
+                    <img src="http://127.0.0.1:8770/api/network/disable">
+                就能让全班断网（同源策略拦的是「读响应」，不是「发请求」）。
+
+                判据用 Fetch Metadata（Chrome 76+/Edge/Firefox 90+ 均发送）：
+                  - 地址栏直接访问 → Sec-Fetch-Site: none,       Sec-Fetch-Dest: document  → 放行
+                  - <img> 加载      → Sec-Fetch-Site: cross-site, Sec-Fetch-Dest: image     → 拦截
+                  - 跨站 fetch/表单 → Sec-Fetch-Site: cross-site（且通常带 Origin）        → 拦截
+                  - curl / PowerShell / Python requests → 这些头一个都不发                 → 放行
+                """
+                origin = (self.headers.get("Origin") or "").strip()
+                if origin:
+                    allowed = {
+                        f"http://{outer.host}:{outer.port}",
+                        f"http://127.0.0.1:{outer.port}",
+                        f"http://localhost:{outer.port}",
+                    }
+                    if origin not in allowed:
+                        return f"跨源 Origin: {origin}"
+                site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+                if site and site not in ("none", "same-origin"):
+                    return f"Sec-Fetch-Site: {site}"
+                dest = (self.headers.get("Sec-Fetch-Dest") or "").strip().lower()
+                if dest and dest not in ("document", "empty"):
+                    return f"Sec-Fetch-Dest: {dest}"
+                return ""
 
             def _dispatch(self):
                 parsed = urlparse(self.path)
@@ -114,7 +155,19 @@ class ControlAPIServer:
                     self._send(200, {"ok": True, "agents": data})
                     return
 
-                # 写操作需鉴权
+                # 写操作：先挡 CSRF，再鉴权。
+                # 令牌通过请求头提供时跳过——能设自定义头就说明不是 <img>/<form> 型 CSRF。
+                if not self._token_in_header():
+                    reason = self._csrf_reason()
+                    if reason:
+                        logger.warning(
+                            f"已拦截疑似 CSRF 请求 [{self.address_string()}] "
+                            f"{self.command} {path} （{reason}）"
+                        )
+                        self._send(403, {"ok": False, "error": "cross-site request blocked",
+                                         "detail": reason})
+                        return
+
                 if not self._authorized(query):
                     self._send(401, {"ok": False, "error": "unauthorized"})
                     return
@@ -174,10 +227,10 @@ class ControlAPIServer:
                 self._dispatch()
 
             def do_OPTIONS(self):
+                # 不下发任何 Access-Control-* 头 → 浏览器跨源预检失败，跨站脚本无法调用本接口。
+                # 服务端调用方（curl / PowerShell / Python / 学习平台 exe）不受同源策略约束，不受影响。
                 self.send_response(204)
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "Authorization, X-API-Token, Content-Type")
+                self.send_header("Allow", "GET, POST, OPTIONS")
                 self.end_headers()
 
         return Handler

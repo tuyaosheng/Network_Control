@@ -24,10 +24,23 @@ from shared.protocol import (
 logger = logging.getLogger("ws_server")
 
 
+def _ws_local_ip(ws) -> str:
+    """取本连接的本端 IP（被控端连过来时打在主控端哪张网卡上）。"""
+    try:
+        return ws.local_address[0] if ws else ""
+    except Exception:
+        return ""
+
+
 class ConnectedAgent:
     def __init__(self, ws: WebSocketServerProtocol | None, ip: str):
         self.ws            = ws
         self.ip            = ip
+        # 本连接的【本端】地址：被控端实际连到主控端的哪个 IP。
+        # 多网卡教师机（有线+无线 / VPN / 虚拟网卡）不能靠 connect("8.8.8.8") 猜，
+        # 那样拿到的是朝互联网那张网卡，下发给被控端后它会给错误 IP 加主机路由，
+        # 断网后就连不回主控端了。
+        self.local_ip      = _ws_local_ip(ws)
         self.hostname      = ""
         self.mac           = ""
         self.filter_active = False
@@ -85,10 +98,26 @@ class ControllerServer:
                          target_ip: str | None = None,
                          tray_pwd_hash: str = "",
                          unlock_pwd_hash: str = ""):
-        controller_ip = self._get_local_ip()
-        raw = msg_update_rules(domains, lan_subnets, controller_ip, upstream_dns,
-                               mode, tray_pwd_hash, unlock_pwd_hash)
-        await self._broadcast(raw, target_ip)
+        """下发规则。controller_ip 按【每台被控端各自连到的本端 IP】逐台生成——
+        多网卡教师机（有线+无线 / VPN / 虚拟网卡）若统一用 connect("8.8.8.8") 猜，
+        会把朝互联网那张网卡的 IP 发下去，被控端断网后按错误 IP 加主机路由就连不回来了。"""
+        async with self._lock:
+            targets = (
+                [self._agents[target_ip]] if target_ip and target_ip in self._agents
+                else list(self._agents.values())
+            )
+        fallback = self._get_local_ip()
+        failed = []
+        for agent in targets:
+            controller_ip = agent.local_ip or fallback
+            raw = msg_update_rules(domains, lan_subnets, controller_ip, upstream_dns,
+                                   mode, tray_pwd_hash, unlock_pwd_hash)
+            try:
+                await agent.ws.send(raw)
+            except Exception as e:
+                logger.warning(f"发送失败 [{agent.ip}]: {e}")
+                failed.append(agent.ip)
+        await self._drop_failed(failed)
 
     async def set_filter(self, enabled: bool, mode: str = MODE_WHITELIST,
                          target_ip: str | None = None):
@@ -119,6 +148,10 @@ class ControllerServer:
             except Exception as e:
                 logger.warning(f"发送失败 [{agent.ip}]: {e}")
                 failed.append(agent.ip)
+        await self._drop_failed(failed)
+
+    async def _drop_failed(self, failed: list[str]):
+        """把发送失败的被控端移到离线池。"""
         for ip in failed:
             async with self._lock:
                 agent = self._agents.pop(ip, None)
@@ -139,6 +172,7 @@ class ControllerServer:
                 agent = prev
                 agent.ws        = ws
                 agent.is_online = True
+                agent.local_ip  = _ws_local_ip(ws)   # 重连可能落在另一张网卡上，刷新
                 agent.connected_at = datetime.now()
             else:
                 agent = ConnectedAgent(ws, ip)
