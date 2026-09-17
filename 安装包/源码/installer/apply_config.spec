@@ -1,0 +1,46 @@
+# -*- mode: python ; coding: utf-8 -*-
+import os
+
+root = os.path.dirname(os.path.dirname(os.path.abspath(SPEC)))
+
+a = Analysis(
+    [os.path.join(root, 'installer', 'apply_config.py')],
+    pathex=[root],
+    binaries=[],
+    datas=[],
+    hiddenimports=[
+        'controller.db.database',
+        'shared.paths',
+        'sqlite3',
+        'ipaddress',
+    ],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=['tkinter', 'PyQt6'],
+    noarchive=False,
+)
+
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name='apply_config',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    uac_admin=False,
+)

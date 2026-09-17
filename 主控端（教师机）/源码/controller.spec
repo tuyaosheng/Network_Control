@@ -10,7 +10,9 @@ a = Analysis(
     [os.path.join(root, 'controller', 'main.py')],
     pathex=[root],
     binaries=ws_binaries,
-    datas=ws_datas,
+    datas=ws_datas + [
+        (os.path.join(root, 'controller', 'assets', 'app.ico'), 'controller/assets'),
+    ],
     hiddenimports=ws_hidden + [
         'PyQt6.sip',
         'PyQt6.QtPrintSupport',
@@ -43,7 +45,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='主控端',
+    name='网络控制器主控端',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -57,4 +59,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     uac_admin=False,
+    icon=os.path.join(root, 'controller', 'assets', 'app.ico'),
 )

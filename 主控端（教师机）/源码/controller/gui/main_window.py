@@ -89,7 +89,7 @@ class MainWindow(QMainWindow):
     # ── UI 构建 ───────────────────────────────────────────────────
 
     def _build_ui(self):
-        self.setWindowTitle("局域网网络控制 - 主控端")
+        self.setWindowTitle("网络控制器主控端")
         self.resize(1240, 760)
 
         central = QWidget()
