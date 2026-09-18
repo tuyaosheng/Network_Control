@@ -35,6 +35,14 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo [+] 打包被控端一键安装器...
+pyinstaller installer\agent_installer.spec --clean --noconfirm
+if errorlevel 1 (
+    echo [!] 被控端一键安装器打包失败
+    pause
+    exit /b 1
+)
+
 echo [+] 查找 Inno Setup 编译器 (ISCC.exe)...
 set ISCC=
 where ISCC.exe >nul 2>&1
