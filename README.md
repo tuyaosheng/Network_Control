@@ -88,9 +88,9 @@
    ```
    {安装目录}\
      主控端\网络控制器主控端.exe / apply_config.exe / controller.db（已配好网段和密码）
-     被控端（学生机）\CTR.exe / config.json（已配好 controller_url、网段、密码哈希）
+     被控端（学生机）\CTR.exe / config.json（已配好 controller_url、网段、密码哈希）/ install_agent.bat / uninstall_agent.bat
    ```
-6. 把 **`被控端（学生机）`** 文件夹整个复制到每台学生机，管理员运行里面的 `CTR.exe install && CTR.exe start`（详见该文件夹 `使用说明.md`）。
+6. 把 **`被控端（学生机）`** 文件夹整个复制到每台学生机，**管理员身份**运行里面的 `install_agent.bat`（自动提权 + 装服务 + 写日志，详见该文件夹 `使用说明.md`）。
 
 更多细节见 `安装包/使用说明.md`。不想用安装包、想自己控制每一步的，按下面手动部署：
 

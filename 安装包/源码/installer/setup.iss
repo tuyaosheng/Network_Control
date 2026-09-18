@@ -31,6 +31,8 @@ Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 Source: "..\dist\网络控制器主控端.exe"; DestDir: "{app}\{#ControllerFolder}"; Flags: ignoreversion
 Source: "..\dist\apply_config.exe";     DestDir: "{app}\{#ControllerFolder}"; Flags: ignoreversion
 Source: "..\dist\CTR.exe";              DestDir: "{app}\{#AgentFolder}";      Flags: ignoreversion
+Source: "..\install_agent.bat";         DestDir: "{app}\{#AgentFolder}";      Flags: ignoreversion
+Source: "..\uninstall_agent.bat";       DestDir: "{app}\{#AgentFolder}";      Flags: ignoreversion
 
 [Icons]
 Name: "{autodesktop}\网络控制器主控端"; Filename: "{app}\{#ControllerFolder}\网络控制器主控端.exe"
