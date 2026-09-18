@@ -44,7 +44,7 @@
 └── 被控端（学生机）/
     ├── CTR.exe                 打包程序（安装为 Windows 服务）
     ├── config.json             默认配置文件（部署前改 controller_url 为教师机 IP）
-    ├── 安装被控端.exe          推荐：双击自动弹 UAC 装服务，不用手动右键选管理员运行
+    ├── 网络控制器学生端.exe          推荐：双击自动弹 UAC 装服务，不用手动右键选管理员运行
     ├── install_agent.bat       备用脚本版：效果同上（自动提权 + 装服务 + 写日志）
     ├── uninstall_agent.bat     卸载脚本
     ├── 使用说明.md             系统使用说明
@@ -89,9 +89,9 @@
    ```
    {安装目录}\
      主控端\网络控制器主控端.exe / apply_config.exe / controller.db（已配好网段和密码）
-     被控端（学生机）\CTR.exe / config.json（已配好 controller_url、网段、密码哈希）/ 安装被控端.exe / install_agent.bat / uninstall_agent.bat
+     被控端（学生机）\CTR.exe / config.json（已配好 controller_url、网段、密码哈希）/ 网络控制器学生端.exe / install_agent.bat / uninstall_agent.bat
    ```
-6. 把 **`被控端（学生机）`** 文件夹整个复制到每台学生机，双击里面的 **`安装被控端.exe`**——自动弹一次 UAC 确认框（点"是"即可），不用手动右键选"以管理员身份运行"（详见该文件夹 `使用说明.md`）。
+6. 把 **`被控端（学生机）`** 文件夹整个复制到每台学生机，双击里面的 **`网络控制器学生端.exe`**——自动弹一次 UAC 确认框（点"是"即可），不用手动右键选"以管理员身份运行"（详见该文件夹 `使用说明.md`）。
 
 更多细节见 `安装包/使用说明.md`。不想用安装包、想自己控制每一步的，按下面手动部署：
 
@@ -110,8 +110,8 @@
    ```json
    { "controller_url": "ws://192.168.1.100:8765", ... }
    ```
-2. 把 `CTR.exe`、`config.json`、`安装被控端.exe`（或 `install_agent.bat`）**放进学生机本地同一文件夹**（先解压，别在压缩包里直接跑）。
-3. 双击 `安装被控端.exe`，会自动弹一次 UAC 确认框（点"是"即可，不用手动右键选管理员运行）。它会：装服务 → 启动 → 写 `install_agent.log`。（也可以用脚本版 `install_agent.bat`，效果完全一样，只是需要手动右键选"以管理员身份运行"。）
+2. 把 `CTR.exe`、`config.json`、`网络控制器学生端.exe`（或 `install_agent.bat`）**放进学生机本地同一文件夹**（先解压，别在压缩包里直接跑）。
+3. 双击 `网络控制器学生端.exe`，会自动弹一次 UAC 确认框（点"是"即可，不用手动右键选管理员运行）。它会：装服务 → 启动 → 写 `install_agent.log`。（也可以用脚本版 `install_agent.bat`，效果完全一样，只是需要手动右键选"以管理员身份运行"。）
 4. 验证：学生机执行 `sc query NetControlAgent`，看到 `STATE: 4 RUNNING`；再到主控端面板看到这台机器上线即成功。
 
 > 卸载：运行 `uninstall_agent.bat`，或管理员 `CTR.exe remove`。

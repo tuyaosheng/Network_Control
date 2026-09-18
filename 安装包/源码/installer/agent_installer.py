@@ -37,7 +37,7 @@ def _log(logf, msg: str) -> None:
 
 def main() -> int:
     try:
-        ctypes.windll.kernel32.SetConsoleTitleW("CTR 安装")
+        ctypes.windll.kernel32.SetConsoleTitleW("网络控制器学生端")
     except Exception:
         pass
 

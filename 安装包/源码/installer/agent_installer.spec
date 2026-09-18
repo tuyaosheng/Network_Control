@@ -24,7 +24,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='安装被控端',
+    name='网络控制器学生端',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -38,4 +38,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     uac_admin=True,
+    icon=os.path.join(root, 'installer', 'assets', 'student_icon.ico'),
 )
