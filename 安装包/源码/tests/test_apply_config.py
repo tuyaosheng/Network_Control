@@ -130,3 +130,37 @@ def test_main_rejects_empty_password(tmp_path, capsys):
     ])
     assert exit_code == 1
     assert "密码不能为空" in capsys.readouterr().err
+
+
+def test_payload_roundtrip_keeps_template_bytes(tmp_path):
+    from installer.payload import read_config, write_with_config
+
+    template = tmp_path / "tpl.exe"
+    template.write_bytes(b"MZ" + b"\x00" * 100 + b"tail")
+    out = tmp_path / "out.exe"
+    cfg = {"controller_url": "ws://192.168.1.100:8765", "lan_subnets": ["192.168.1.0/24"]}
+    write_with_config(str(template), str(out), cfg)
+
+    assert out.read_bytes().startswith(template.read_bytes())
+    assert read_config(str(out)) == cfg
+    assert read_config(str(template)) is None
+
+
+def test_main_with_agent_template_builds_single_installer(tmp_path):
+    from installer.payload import read_config
+
+    template = tmp_path / "template.exe"
+    template.write_bytes(b"MZ-fake-installer")
+    agent_dir = tmp_path / "agent"
+    exit_code = main([
+        "--controller-dir", str(tmp_path / "controller"),
+        "--agent-dir", str(agent_dir),
+        "--ip", "192.168.1.100",
+        "--password", "admin123",
+        "--agent-template", str(template),
+    ])
+    assert exit_code == 0
+    assert [p.name for p in agent_dir.iterdir()] == ["网络控制器学生端.exe"]
+    cfg = read_config(str(agent_dir / "网络控制器学生端.exe"))
+    assert cfg["controller_url"] == "ws://192.168.1.100:8765"
+    assert cfg["unlock_password_hash"] == ADMIN123_HASH

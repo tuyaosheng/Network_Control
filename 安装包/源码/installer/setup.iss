@@ -1,6 +1,8 @@
 ; 网络控制器CTR - 主控端安装程序
-; 依赖 dist\ 下已经编译好的：网络控制器主控端.exe / apply_config.exe / CTR.exe
+; 依赖 dist\ 下已经编译好的：网络控制器主控端.exe / apply_config.exe / 网络控制器学生端.exe（已内置 CTR.exe）
 ; 编译：ISCC installer\setup.iss（由 build_installer.bat 调用）
+; 被控端（学生机）文件夹里只有一个 网络控制器学生端.exe：apply_config 安装时把本机配置追加进去，
+; 复制到学生机双击即解压到 C:\Users\Public\Documents\NetControl 并装服务。
 
 #define AppName "网络控制器CTR"
 #define AppVersion "2.0.0"
@@ -11,7 +13,8 @@
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppName}
-DefaultDirName=C:\Users\Public\Documents\NetControl
+; 有 D 盘（本地硬盘）装到 D:\NetControl，没有则退回公共文档目录
+DefaultDirName={code:GetDefaultDir}
 DefaultGroupName=网络控制器CTR
 DisableProgramGroupPage=yes
 OutputDir=..\dist
@@ -30,10 +33,20 @@ Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 [Files]
 Source: "..\dist\网络控制器主控端.exe"; DestDir: "{app}\{#ControllerFolder}"; Flags: ignoreversion
 Source: "..\dist\apply_config.exe";     DestDir: "{app}\{#ControllerFolder}"; Flags: ignoreversion
-Source: "..\dist\CTR.exe";              DestDir: "{app}\{#AgentFolder}";      Flags: ignoreversion
-Source: "..\dist\网络控制器学生端.exe";  DestDir: "{app}\{#AgentFolder}";      Flags: ignoreversion
-Source: "..\install_agent.bat";         DestDir: "{app}\{#AgentFolder}";      Flags: ignoreversion
-Source: "..\uninstall_agent.bat";       DestDir: "{app}\{#AgentFolder}";      Flags: ignoreversion
+; 学生端安装器模板：放临时目录，由 apply_config 追加配置后输出到被控端文件夹
+Source: "..\dist\网络控制器学生端.exe";  DestDir: "{tmp}";                    Flags: ignoreversion deleteafterinstall
+
+[InstallDelete]
+; 覆盖安装旧版时，清掉旧的多文件被控端文件夹内容，只留新生成的单个安装器
+Type: files; Name: "{app}\{#AgentFolder}\CTR.exe"
+Type: files; Name: "{app}\{#AgentFolder}\config.json"
+Type: files; Name: "{app}\{#AgentFolder}\install_agent.bat"
+Type: files; Name: "{app}\{#AgentFolder}\uninstall_agent.bat"
+Type: files; Name: "{app}\{#AgentFolder}\install_agent.log"
+
+[UninstallDelete]
+; 安装时生成的文件（不在 [Files] 里，卸载程序不会自动删）
+Type: filesandordirs; Name: "{app}\{#AgentFolder}"
 
 [Icons]
 Name: "{autodesktop}\网络控制器主控端"; Filename: "{app}\{#ControllerFolder}\网络控制器主控端.exe"
@@ -42,7 +55,7 @@ Name: "{group}\卸载网络控制器CTR";      Filename: "{uninstallexe}"
 
 [Run]
 Filename: "{app}\{#ControllerFolder}\apply_config.exe"; \
-    Parameters: "--controller-dir ""{app}\{#ControllerFolder}"" --agent-dir ""{app}\{#AgentFolder}"" --ip ""{code:GetChosenIP}"" --netmask ""{code:GetChosenNetmask}"" --password ""{code:GetChosenPassword}"""; \
+    Parameters: "--controller-dir ""{app}\{#ControllerFolder}"" --agent-dir ""{app}\{#AgentFolder}"" --ip ""{code:GetChosenIP}"" --netmask ""{code:GetChosenNetmask}"" --password ""{code:GetChosenPassword}"" --agent-template ""{tmp}\网络控制器学生端.exe"""; \
     StatusMsg: "正在生成配置..."; Flags: runhidden waituntilterminated
 Filename: "{app}\{#ControllerFolder}\网络控制器主控端.exe"; Description: "运行网络控制器主控端"; Flags: postinstall nowait skipifsilent unchecked
 
@@ -61,6 +74,18 @@ var
   PasswordPage: TInputQueryWizardPage;
 
 { ---------- 工具函数 ---------- }
+
+function GetDriveTypeW(lpRootPathName: String): Cardinal;
+  external 'GetDriveTypeW@kernel32.dll stdcall';
+
+function GetDefaultDir(Param: String): String;
+begin
+  { 3 = DRIVE_FIXED：只认本地硬盘，排除光驱 / U 盘 / 网络盘 }
+  if GetDriveTypeW('D:\') = 3 then
+    Result := 'D:\NetControl'
+  else
+    Result := ExpandConstant('{commondocs}') + '\NetControl';
+end;
 
 function Trim2(const S: String): String;
 begin

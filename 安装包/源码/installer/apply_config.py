@@ -5,10 +5,13 @@
     apply_config.exe --controller-dir <主控端安装目录> --agent-dir <被控端安装目录>
                       --ip <教师机IP> [--netmask <点分掩码，默认 255.255.255.0>]
                       --password <退出/解锁密码明文>
+                      [--agent-template <学生端安装器模板 exe>]
 
 把向导收集到的信息写成：
   - <controller-dir>\\controller.db 里的 lan_subnets / tray_password_hash / unlock_password
-  - <agent-dir>\\config.json（controller_url / lan_subnets / 两个密码哈希）
+  - 被控端配置（controller_url / lan_subnets / 两个密码哈希）：
+      给了 --agent-template → 配置追加进 <agent-dir>\\网络控制器学生端.exe 末尾（单文件部署）
+      没给              → 写成 <agent-dir>\\config.json（旧的手动部署方式）
 """
 import argparse
 import hashlib
@@ -20,9 +23,11 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from controller.db.database import Database
+from installer.payload import write_with_config
 
 CONTROLLER_PORT = "8765"
 UPSTREAM_DNS = "114.114.114.114"
+AGENT_INSTALLER_NAME = "网络控制器学生端.exe"
 
 
 def sha256_hex(password: str) -> str:
@@ -61,6 +66,15 @@ def write_agent_config(agent_dir: str, ip: str, subnet: str, password_hash: str)
         json.dump(config, f, ensure_ascii=False, indent=2)
 
 
+def write_agent_installer(template: str, agent_dir: str, ip: str, subnet: str,
+                          password_hash: str) -> str:
+    """生成带内嵌配置的学生端安装器，返回输出路径。"""
+    config = build_agent_config(ip, subnet, password_hash)
+    out_path = os.path.join(agent_dir, AGENT_INSTALLER_NAME)
+    write_with_config(template, out_path, config)
+    return out_path
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="安装时生成主控端/被控端配置")
     parser.add_argument("--controller-dir", required=True)
@@ -68,6 +82,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--ip", required=True)
     parser.add_argument("--netmask", default="255.255.255.0")
     parser.add_argument("--password", required=True)
+    parser.add_argument("--agent-template", default="",
+                        help="学生端安装器模板 exe；给出时生成单文件学生端安装器，不再写 config.json")
     return parser.parse_args(argv)
 
 
@@ -96,7 +112,11 @@ def main(argv=None) -> int:
         os.makedirs(args.controller_dir, exist_ok=True)
         os.makedirs(args.agent_dir, exist_ok=True)
         write_controller_db(args.controller_dir, subnet, password_hash)
-        write_agent_config(args.agent_dir, args.ip, subnet, password_hash)
+        if args.agent_template:
+            write_agent_installer(args.agent_template, args.agent_dir,
+                                  args.ip, subnet, password_hash)
+        else:
+            write_agent_config(args.agent_dir, args.ip, subnet, password_hash)
     except OSError as e:
         print(f"[apply_config] 写入配置失败: {e}", file=sys.stderr)
         return 1

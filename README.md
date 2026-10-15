@@ -82,16 +82,16 @@
 **安装步骤**：
 
 1. 双击运行安装程序。
-2. **选择安装目录**（默认 `C:\Users\Public\Documents\NetControl`，可以改）。
+2. **选择安装目录**（默认 `D:\NetControl`；没有 D 盘时默认 `C:\Users\Public\Documents\NetControl`，都可以改）。
 3. **选择教师机 IP**：自动检测本机网卡列表，选连接学生机所在局域网的那一个；检测不到就手动填 IP + 子网掩码。下方会实时显示自动算出的局域网网段（`lan_subnets`）。
 4. **设置退出/解锁密码**：同时用作被控端托盘「退出」密码和拔网线锁屏「解锁」密码，输入两次确认一致。
 5. 完成安装，安装目录下会生成：
    ```
    {安装目录}\
      主控端\网络控制器主控端.exe / apply_config.exe / controller.db（已配好网段和密码）
-     被控端（学生机）\CTR.exe / config.json（已配好 controller_url、网段、密码哈希）/ 网络控制器学生端.exe / install_agent.bat / uninstall_agent.bat
+     被控端（学生机）\网络控制器学生端.exe（单个文件，已内置 CTR.exe、卸载脚本和配好的 controller_url / 网段 / 密码哈希）
    ```
-6. 把 **`被控端（学生机）`** 文件夹整个复制到每台学生机，双击里面的 **`网络控制器学生端.exe`**——自动弹一次 UAC 确认框（点"是"即可），不用手动右键选"以管理员身份运行"（详见该文件夹 `使用说明.md`）。
+6. 把 **`网络控制器学生端.exe`** 复制到每台学生机的任意位置（桌面、U 盘都行），双击运行，点一次 UAC 确认。它会把被控端解压到固定目录 **`C:\Users\Public\Documents\NetControl`**，然后装服务、启动服务，再显示安装日志。装完这个 exe 可以删掉。学生机有还原卡的话，要在还原卡保护模式之外安装。
 
 更多细节见 `安装包/使用说明.md`。不想用安装包、想自己控制每一步的，按下面手动部署：
 
@@ -111,7 +111,7 @@
    { "controller_url": "ws://192.168.1.100:8765", ... }
    ```
 2. 把 `CTR.exe`、`config.json`、`网络控制器学生端.exe`（或 `install_agent.bat`）**放进学生机本地同一文件夹**（先解压，别在压缩包里直接跑）。
-3. 双击 `网络控制器学生端.exe`，会自动弹一次 UAC 确认框（点"是"即可，不用手动右键选管理员运行）。它会：装服务 → 启动 → 写 `install_agent.log`。（也可以用脚本版 `install_agent.bat`，效果完全一样，只是需要手动右键选"以管理员身份运行"。）
+3. 双击 `网络控制器学生端.exe`，会自动弹一次 UAC 确认框（点"是"即可，不用手动右键选管理员运行）。它会读取同文件夹的 `config.json`，把被控端解压到 `C:\Users\Public\Documents\NetControl`，然后装服务、启动服务，安装日志写在该目录的 `install_agent.log`。（脚本版 `install_agent.bat` 则是**在当前文件夹原地**装服务，需要手动右键选"以管理员身份运行"。）
 4. 验证：学生机执行 `sc query NetControlAgent`，看到 `STATE: 4 RUNNING`；再到主控端面板看到这台机器上线即成功。
 
 > 卸载：运行 `uninstall_agent.bat`，或管理员 `CTR.exe remove`。

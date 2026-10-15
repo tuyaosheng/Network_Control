@@ -5,11 +5,13 @@
 底部：日志输出
 """
 import asyncio
+import faulthandler
 import hashlib
 import logging
 import os
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from PyQt6.QtWidgets import (
@@ -21,6 +23,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt6.QtGui import QFont
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+from shared.paths import get_app_dir
 from controller.db.database import Database
 from controller.server.ws_server import ControllerServer, scan_ip_range
 from controller.server.api_server import ControlAPIServer
@@ -478,7 +481,24 @@ class MainWindow(QMainWindow):
             "设置已保存\n端口修改后需重启主控端生效"
         )
 
+    def _start_exit_watchdog(self, timeout: float = 8.0):
+        """关闭后兜底：超时仍未退出，说明某个线程卡住了退出流程——
+        把所有线程的调用栈追加到 controller.log（便于定位），然后强制结束进程。"""
+        def _watch():
+            time.sleep(timeout)
+            try:
+                with open(os.path.join(get_app_dir(), "controller.log"), "a",
+                          encoding="utf-8") as f:
+                    f.write(f"\n[退出看门狗] 关闭 {timeout:.0f} 秒后进程仍未退出，强制结束。各线程调用栈：\n")
+                    f.flush()
+                    faulthandler.dump_traceback(file=f, all_threads=True)
+            finally:
+                os._exit(0)
+
+        threading.Thread(target=_watch, name="exit-watchdog", daemon=True).start()
+
     def closeEvent(self, event):
+        self._start_exit_watchdog()
         if self._api_server:
             self._api_server.stop()
         self._run_async(self.server.stop())

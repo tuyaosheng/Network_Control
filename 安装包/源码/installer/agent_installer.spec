@@ -7,7 +7,11 @@ a = Analysis(
     [os.path.join(root, 'installer', 'agent_installer.py')],
     pathex=[root],
     binaries=[],
-    datas=[],
+    # 内置被控端本体和卸载脚本：学生端只需复制这一个 exe（先打包 agent.spec 生成 dist\CTR.exe）
+    datas=[
+        (os.path.join(root, 'dist', 'CTR.exe'), '.'),
+        (os.path.join(root, 'uninstall_agent.bat'), '.'),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
