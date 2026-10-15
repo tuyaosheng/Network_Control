@@ -10,14 +10,15 @@ import logging
 import os
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QSplitter,
-    QTabWidget, QTextEdit, QStatusBar, QLabel, QGroupBox,
+    QTabWidget, QPlainTextEdit, QStatusBar, QLabel, QGroupBox,
     QLineEdit, QPushButton, QFormLayout, QMessageBox
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
-from PyQt6.QtGui import QFont, QTextCursor
+from PyQt6.QtGui import QFont
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from controller.db.database import Database
@@ -63,6 +64,14 @@ class MainWindow(QMainWindow):
         self._loop: asyncio.AbstractEventLoop | None = None
         self._server_thread: threading.Thread | None = None
         self._api_server: ControlAPIServer | None = None
+        # DB 写入放到单独线程（单 worker 保证写入顺序），点击按钮时 UI 线程不碰磁盘
+        self._db_writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="db_writer")
+        # 日志缓冲：大量 ACK 同时到达时合并为一次追加，避免逐条重绘日志框
+        self._log_buffer: list[str] = []
+        self._log_flush = QTimer()
+        self._log_flush.setSingleShot(True)
+        self._log_flush.setInterval(100)
+        self._log_flush.timeout.connect(self._flush_log)
 
         self._build_ui()
         self._setup_logging()
@@ -119,8 +128,9 @@ class MainWindow(QMainWindow):
 
         log_box = QGroupBox("运行日志")
         log_layout = QVBoxLayout(log_box)
-        self._log_view = QTextEdit()
+        self._log_view = QPlainTextEdit()
         self._log_view.setReadOnly(True)
+        self._log_view.setMaximumBlockCount(2000)   # 只保留最近 2000 行，防止越用越卡
         self._log_view.setFont(QFont("Consolas", 9))
         self._log_view.setMaximumHeight(160)
         log_layout.addWidget(self._log_view)
@@ -193,8 +203,18 @@ class MainWindow(QMainWindow):
         logging.getLogger().addHandler(handler)
 
     def _append_log(self, msg: str):
-        self._log_view.append(msg)
-        self._log_view.moveCursor(QTextCursor.MoveOperation.End)
+        self._log_buffer.append(msg)
+        if not self._log_flush.isActive():
+            self._log_flush.start()
+
+    def _flush_log(self):
+        if not self._log_buffer:
+            return
+        text = "\n".join(self._log_buffer)
+        self._log_buffer.clear()
+        self._log_view.appendPlainText(text)
+        sb = self._log_view.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
     # ── 服务器 ────────────────────────────────────────────────────
 
@@ -314,6 +334,13 @@ class MainWindow(QMainWindow):
         if self._loop:
             asyncio.run_coroutine_threadsafe(coro, self._loop)
 
+    def _persist_states(self, ips: list[str], state: str):
+        """记录权威状态：内存立即更新（重连恢复用），DB 在后台线程批量写入。"""
+        targets = list(ips) if ips else self.server.get_online_ips()
+        for ip in targets:
+            self.server.update_saved_state(ip, state)
+        self._db_writer.submit(self.db.save_machine_states, targets, state)
+
     def _get_lan_upstream(self) -> tuple[list[str], str]:
         lan_raw     = self.db.get_setting("lan_subnets", "192.168.1.0/24")
         upstream    = self.db.get_setting("upstream_dns", "114.114.114.114")
@@ -348,9 +375,7 @@ class MainWindow(QMainWindow):
 
         self._run_async(_do())
         # 保存状态，用于被控端重连后自动恢复
-        for ip in (ips if ips else self.server.get_online_ips()):
-            self.server.update_saved_state(ip, "whitelist")
-            self.db.save_machine_state(ip, "whitelist")
+        self._persist_states(ips, "whitelist")
         n = "全部" if not ips else f"{len(ips)} 台"
         self._append_log(
             f"[操作] 已向 {n} 被控端启动白名单过滤（{len(domains)} 条域名）"
@@ -377,9 +402,7 @@ class MainWindow(QMainWindow):
 
         self._run_async(_do())
         # 保存状态，用于被控端重连后自动恢复
-        for ip in (ips if ips else self.server.get_online_ips()):
-            self.server.update_saved_state(ip, "blacklist")
-            self.db.save_machine_state(ip, "blacklist")
+        self._persist_states(ips, "blacklist")
         n = "全部" if not ips else f"{len(ips)} 台"
         self._append_log(
             f"[操作] 已向 {n} 被控端启动黑名单过滤（{len(domains)} 条域名）"
@@ -394,14 +417,12 @@ class MainWindow(QMainWindow):
 
         self._run_async(_do())
         # 保存状态，用于被控端重连后自动恢复
-        for ip in (ips if ips else self.server.get_online_ips()):
-            self.server.update_saved_state(ip, "disconnect")
-            self.db.save_machine_state(ip, "disconnect")
+        self._persist_states(ips, "disconnect")
         n = "全部" if not ips else f"{len(ips)} 台"
         self._append_log(f"[操作] 已向 {n} 被控端发送「禁止上网」（局域网保留）")
 
     def _on_allow_all(self, ips: list[str]):
-        """全部允许上网：先停止过滤、再恢复路由，覆盖任何当前状态。"""
+        """允许上网：先停止过滤、再恢复路由，覆盖任何当前状态。"""
         targets = ips if ips else [None]
 
         async def _do():
@@ -413,11 +434,9 @@ class MainWindow(QMainWindow):
 
         self._run_async(_do())
         # 保存状态，用于被控端重连后自动恢复
-        for ip in (ips if ips else self.server.get_online_ips()):
-            self.server.update_saved_state(ip, "normal")
-            self.db.save_machine_state(ip, "normal")
+        self._persist_states(ips, "normal")
         n = "全部" if not ips else f"{len(ips)} 台"
-        self._append_log(f"[操作] 已向 {n} 被控端发送「全部允许上网」")
+        self._append_log(f"[操作] 已向 {n} 被控端发送「允许上网」")
 
     def _on_scan(self, subnet: str):
         self._append_log(f"[扫描] 正在扫描 {subnet} ...")
@@ -463,4 +482,5 @@ class MainWindow(QMainWindow):
         if self._api_server:
             self._api_server.stop()
         self._run_async(self.server.stop())
+        self._db_writer.shutdown(wait=True)   # 确保状态已落盘
         event.accept()

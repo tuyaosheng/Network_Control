@@ -3,6 +3,8 @@
 按钮逻辑：
   - 未勾选任何 / 全部勾选 → 应用到所有在线被控端
   - 勾选了部分 → 只应用到勾选的被控端
+多选：表格行选中即勾选，支持 单击 / Ctrl+单击 / Shift+单击 / 拖选 / Ctrl+A；
+      单击 checkbox 列等同 Ctrl+单击（切换该行，不影响其他行）
 """
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
@@ -12,7 +14,7 @@ from PyQt6.QtWidgets import (
 )
 import ipaddress as _ipmod
 
-from PyQt6.QtCore import Qt, pyqtSignal, QRect, QPoint
+from PyQt6.QtCore import Qt, pyqtSignal, QRect, QEvent, QItemSelection, QItemSelectionModel
 from PyQt6.QtGui import QColor, QFont, QPainter
 
 NET_STATE_DISPLAY = {
@@ -80,6 +82,27 @@ class _CheckBoxHeader(QHeaderView):
         )
 
 
+class _MachineTable(QTableWidget):
+    """单击 checkbox 列 = Ctrl+单击（切换该行）；其余位置为标准 Shift/Ctrl 多选。"""
+
+    def selectionCommand(self, index, event=None):
+        if (event is not None and index.isValid() and index.column() == COL_CHECK
+                and event.type() in (QEvent.Type.MouseButtonPress,
+                                     QEvent.Type.MouseButtonRelease,
+                                     QEvent.Type.MouseButtonDblClick)
+                and not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier)):
+            if event.type() == QEvent.Type.MouseButtonPress:
+                return (QItemSelectionModel.SelectionFlag.Toggle
+                        | QItemSelectionModel.SelectionFlag.Rows)
+            return QItemSelectionModel.SelectionFlag.NoUpdate
+        return super().selectionCommand(index, event)
+
+
+_FLAGS_ONLINE  = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+_FLAGS_OFFLINE = Qt.ItemFlag.ItemIsEnabled          # 离线行不可选中
+_COLOR_TEXT_OFFLINE = QColor(160, 160, 160)
+
+
 class _BrowseDialog(QDialog):
     def __init__(self, ip: str, domains: list, parent=None):
         super().__init__(parent)
@@ -105,7 +128,7 @@ class _BrowseDialog(QDialog):
 
 
 class MachinePanel(QWidget):
-    sig_allow_all       = pyqtSignal(list)   # 全部允许上网（恢复正常）
+    sig_allow_all       = pyqtSignal(list)   # 允许上网（恢复正常）
     sig_start_whitelist = pyqtSignal(list)   # 启动白名单过滤
     sig_start_blacklist = pyqtSignal(list)   # 启动黑名单过滤
     sig_disconnect      = pyqtSignal(list)   # 禁止上网（保留局域网）
@@ -117,6 +140,7 @@ class MachinePanel(QWidget):
         self._checked_ips: set[str] = set()
         self._sort_col: int = COL_IP   # 默认按 IP 排序
         self._sort_asc: bool = True
+        self._syncing: bool = False      # 程序内恢复选区时屏蔽 selectionChanged 回写
         self._build_ui()
 
     def _build_ui(self):
@@ -131,7 +155,7 @@ class MachinePanel(QWidget):
         ab.setContentsMargins(10, 6, 10, 6)
         ab.setSpacing(10)
 
-        btn_allow      = QPushButton("✅  全部允许上网")
+        btn_allow      = QPushButton("✅  允许上网")
         btn_whitelist  = QPushButton("▶  启动白名单")
         btn_blacklist  = QPushButton("▶  启动黑名单")
         btn_disconnect = QPushButton("⛔  禁止上网")
@@ -177,11 +201,14 @@ class MachinePanel(QWidget):
         scan_row.addWidget(self._scan_input)
         scan_row.addWidget(btn_scan)
         scan_row.addSpacing(12)
+        tip = QLabel("提示：Ctrl / Shift 多选，拖动框选，Ctrl+A 全选")
+        tip.setStyleSheet("color:gray;font-size:11px;")
+        scan_row.addWidget(tip)
         scan_row.addStretch()
         scan_row.addWidget(self._label_count)
 
         # ── 被控端表格 ────────────────────────────────────────────────
-        self._table = QTableWidget(0, len(COLS))
+        self._table = _MachineTable(0, len(COLS))
         self._table.setHorizontalHeaderLabels(COLS)
         # 自定义表头（COL_CHECK 列绘制全选 checkbox）
         self._header = _CheckBoxHeader(self._table)
@@ -201,61 +228,69 @@ class MachinePanel(QWidget):
         self._header.sectionClicked.connect(self._on_col_clicked)
 
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._table.verticalHeader().setVisible(False)
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.setAlternatingRowColors(True)
         self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._show_context_menu)
-        self._table.itemChanged.connect(self._on_checkbox_changed)
+        self._table.itemSelectionChanged.connect(self._on_selection_changed)
 
         layout.addWidget(action_bar)
         layout.addLayout(scan_row)
         layout.addWidget(self._table)
 
-    # ── 勾选逻辑 ─────────────────────────────────────────────────────
+    # ── 勾选逻辑（勾选 = 行选中）────────────────────────────────────
 
-    def _on_checkbox_changed(self, item: QTableWidgetItem):
-        if item.column() != COL_CHECK:
+    def _on_selection_changed(self):
+        if self._syncing:
             return
-        ip_item = self._table.item(item.row(), COL_IP)
-        if not ip_item:
-            return
-        ip = ip_item.text()
-        if item.checkState() == Qt.CheckState.Checked:
-            self._checked_ips.add(ip)
-        else:
-            self._checked_ips.discard(ip)
+        online = self._online_ips()
+        checked = set()
+        for idx in self._table.selectionModel().selectedRows():
+            ip_item = self._table.item(idx.row(), COL_IP)
+            if ip_item and ip_item.text() in online:
+                checked.add(ip_item.text())
+        self._checked_ips = checked
+        self._sync_checkboxes()
         self._update_header_state()
+
+    def _sync_checkboxes(self):
+        """按 _checked_ips 刷新 checkbox 列显示（只改有变化的格子）。"""
+        for row in range(self._table.rowCount()):
+            chk = self._table.item(row, COL_CHECK)
+            ip_item = self._table.item(row, COL_IP)
+            if not chk or not ip_item:
+                continue
+            want = (Qt.CheckState.Checked if ip_item.text() in self._checked_ips
+                    else Qt.CheckState.Unchecked)
+            if chk.checkState() != want:
+                chk.setCheckState(want)
+
+    def _apply_selection(self):
+        """按 _checked_ips 恢复表格选区（重新排序/刷新后行号会变）。"""
+        sel = QItemSelection()
+        model = self._table.model()
+        last_col = self._table.columnCount() - 1
+        for row in range(self._table.rowCount()):
+            ip_item = self._table.item(row, COL_IP)
+            if ip_item and ip_item.text() in self._checked_ips:
+                sel.select(model.index(row, 0), model.index(row, last_col))
+        self._syncing = True
+        try:
+            self._table.selectionModel().select(
+                sel, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        finally:
+            self._syncing = False
+        self._sync_checkboxes()
 
     def _toggle_select_all(self):
         """表头 checkbox 点击：全已选→清空，否则→全选（仅针对在线机器）。"""
         online = self._online_ips()
         if online and self._checked_ips >= online:
-            self._deselect_all()
+            self._table.clearSelection()
         else:
-            self._select_all()
-
-    def _select_all(self):
-        self._table.blockSignals(True)
-        for row in range(self._table.rowCount()):
-            chk = self._table.item(row, COL_CHECK)
-            ip_item = self._table.item(row, COL_IP)
-            if chk and ip_item and not (chk.flags() & Qt.ItemFlag.ItemIsEnabled == Qt.ItemFlag(0)):
-                # 只勾选可用（在线）的行
-                if chk.flags() & Qt.ItemFlag.ItemIsEnabled:
-                    chk.setCheckState(Qt.CheckState.Checked)
-                    self._checked_ips.add(ip_item.text())
-        self._table.blockSignals(False)
-        self._update_header_state()
-
-    def _deselect_all(self):
-        self._table.blockSignals(True)
-        for row in range(self._table.rowCount()):
-            chk = self._table.item(row, COL_CHECK)
-            if chk:
-                chk.setCheckState(Qt.CheckState.Unchecked)
-        self._checked_ips.clear()
-        self._table.blockSignals(False)
-        self._update_header_state()
+            self._table.selectAll()      # 离线行不可选中，自动跳过
 
     def _update_header_state(self):
         online = self._online_ips()
@@ -365,56 +400,56 @@ class MachinePanel(QWidget):
         self._checked_ips &= self._online_ips()   # 断开的 IP 从勾选中移除
         self._render()
 
+    def _set_cell(self, row: int, col: int, text: str, online: bool,
+                  fg: QColor | None = None, checkable: bool = False):
+        """原地更新单元格；值没变时 Qt 不会发 dataChanged，不触发重绘和列宽重算。"""
+        item = self._table.item(row, col)
+        if item is None:
+            item = QTableWidgetItem()
+            self._table.setItem(row, col, item)
+        if item.text() != text:
+            item.setText(text)
+        flags = _FLAGS_ONLINE if online else _FLAGS_OFFLINE
+        if item.flags() != flags:
+            item.setFlags(flags)
+        if checkable and item.data(Qt.ItemDataRole.CheckStateRole) is None:
+            item.setCheckState(Qt.CheckState.Unchecked)
+        if fg is None and not online:
+            fg = _COLOR_TEXT_OFFLINE
+        item.setData(Qt.ItemDataRole.ForegroundRole, fg)
+        item.setData(Qt.ItemDataRole.BackgroundRole, None if online else _COLOR_OFFLINE_BG)
+
     def _render(self):
         agents = self._sorted_agents()
-        self._table.blockSignals(True)
-        self._table.setRowCount(len(agents))
-        for row, a in enumerate(agents):
-            ip        = a.get("ip", "")
-            is_online = a.get("is_online", True)
-            net_state = "offline" if not is_online else a.get("net_state", "normal")
-            label, color = NET_STATE_DISPLAY.get(
-                net_state, ("未知", QColor(150, 150, 150))
-            )
-
-            chk = QTableWidgetItem()
-            if is_online:
-                chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
-                chk.setCheckState(
-                    Qt.CheckState.Checked if ip in self._checked_ips
-                    else Qt.CheckState.Unchecked
+        self._table.setUpdatesEnabled(False)
+        self._syncing = True
+        try:
+            if self._table.rowCount() != len(agents):
+                self._table.setRowCount(len(agents))
+            for row, a in enumerate(agents):
+                ip        = a.get("ip", "")
+                is_online = a.get("is_online", True)
+                net_state = "offline" if not is_online else a.get("net_state", "normal")
+                label, color = NET_STATE_DISPLAY.get(
+                    net_state, ("未知", QColor(150, 150, 150))
                 )
-            else:
-                # 离线行：checkbox 禁用，不可勾选
-                chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable)
-                chk.setCheckState(Qt.CheckState.Unchecked)
-            self._table.setItem(row, COL_CHECK, chk)
+                domains = a.get("recent_domains", [])
+                last_txt = "—"
+                if domains:
+                    last = domains[-1]
+                    last_txt = last.get("domain", "") if isinstance(last, dict) else str(last)
 
-            def _mk(text: str, offline: bool = not is_online) -> QTableWidgetItem:
-                item = QTableWidgetItem(text)
-                if offline:
-                    item.setForeground(QColor(160, 160, 160))
-                    item.setBackground(_COLOR_OFFLINE_BG)
-                return item
-
-            self._table.setItem(row, COL_IP,   _mk(ip))
-            self._table.setItem(row, COL_HOST, _mk(a.get("hostname", "")))
-
-            state_item = _mk(f"● {label}")
-            state_item.setForeground(color)   # 覆盖颜色以显示正确状态色
-            self._table.setItem(row, COL_STATE, state_item)
-
-            self._table.setItem(row, COL_CONN, _mk(a.get("connected_at", "")))
-            self._table.setItem(row, COL_LAST, _mk(a.get("last_seen",    "")))
-
-            domains = a.get("recent_domains", [])
-            last_txt = "—"
-            if domains:
-                last = domains[-1]
-                last_txt = last.get("domain", "") if isinstance(last, dict) else str(last)
-            self._table.setItem(row, COL_BROWSE, _mk(last_txt))
-
-        self._table.blockSignals(False)
+                self._set_cell(row, COL_CHECK,  "", is_online, checkable=True)
+                self._set_cell(row, COL_IP,     ip, is_online)
+                self._set_cell(row, COL_HOST,   a.get("hostname", ""), is_online)
+                self._set_cell(row, COL_STATE,  f"● {label}", is_online, fg=color)
+                self._set_cell(row, COL_CONN,   a.get("connected_at", ""), is_online)
+                self._set_cell(row, COL_LAST,   a.get("last_seen", ""), is_online)
+                self._set_cell(row, COL_BROWSE, last_txt, is_online)
+        finally:
+            self._syncing = False
+        self._apply_selection()
+        self._table.setUpdatesEnabled(True)
         self._update_header_state()
 
         n_online  = sum(1 for a in agents if a.get("is_online", True))
@@ -424,4 +459,6 @@ class MachinePanel(QWidget):
         if n_offline:
             parts.append(f"离线: {n_offline} 台")
         parts.append(f"过滤中: {filtering} 台")
-        self._label_count.setText(" | ".join(parts))
+        text = " | ".join(parts)
+        if self._label_count.text() != text:
+            self._label_count.setText(text)

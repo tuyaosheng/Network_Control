@@ -22,6 +22,9 @@ class Database:
         conn = sqlite3.connect(self.path, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        # WAL + NORMAL：写入不再每次都多次 fsync，批量保存状态时明显更快
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
         return conn
 
     def _init_db(self):
@@ -229,6 +232,20 @@ class Database:
             conn.execute(
                 "INSERT OR REPLACE INTO machine_states (ip, net_state, updated_at) VALUES (?,?,?)",
                 (ip, net_state, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            )
+            conn.commit()
+            conn.close()
+
+    def save_machine_states(self, ips: list[str], net_state: str):
+        """批量保存多台机器状态：一个连接、一次事务，避免逐台 commit 的磁盘开销。"""
+        if not ips:
+            return
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            conn = self._conn()
+            conn.executemany(
+                "INSERT OR REPLACE INTO machine_states (ip, net_state, updated_at) VALUES (?,?,?)",
+                [(ip, net_state, now) for ip in ips]
             )
             conn.commit()
             conn.close()

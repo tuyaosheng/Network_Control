@@ -3,6 +3,8 @@
 每条规则：名称 + 域名 + 启用复选框
 双击「名称」或「域名」单元格可直接编辑，回车或失焦时保存。
 白名单添加对话框带「自动发现依赖」按钮，可批量导入网页引用的资源域名。
+多选：单击 / Ctrl+单击 / Shift+单击 / 拖选 / Ctrl+A；选中多行后点任一选中行的「启用」
+      勾选框，会把同样的状态应用到全部选中行；Delete 键删除选中。
 """
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
@@ -10,7 +12,8 @@ from PyQt6.QtWidgets import (
     QMessageBox, QHeaderView, QAbstractItemView, QListWidget, QListWidgetItem,
     QProgressDialog
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QThread
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QEvent, QItemSelectionModel
+from PyQt6.QtGui import QKeySequence, QShortcut
 
 from controller.db.database import Database
 from controller.dep_discover import discover_dependencies
@@ -19,6 +22,20 @@ COL_CHECK  = 0
 COL_NAME   = 1
 COL_DOMAIN = 2
 COLS = ["启用", "名称", "域名"]
+
+
+class _RuleTable(QTableWidget):
+    """点「启用」勾选框不改变当前选区，便于对多选行批量启用/停用。"""
+
+    def selectionCommand(self, index, event=None):
+        if (event is not None and index.isValid() and index.column() == COL_CHECK
+                and event.type() in (QEvent.Type.MouseButtonPress,
+                                     QEvent.Type.MouseButtonRelease,
+                                     QEvent.Type.MouseButtonDblClick)
+                and not (event.modifiers() & (Qt.KeyboardModifier.ShiftModifier
+                                              | Qt.KeyboardModifier.ControlModifier))):
+            return QItemSelectionModel.SelectionFlag.NoUpdate
+        return super().selectionCommand(index, event)
 
 
 class _DiscoverThread(QThread):
@@ -220,13 +237,14 @@ class _RuleTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
 
-        self._table = QTableWidget(0, 3)
+        self._table = _RuleTable(0, 3)
         self._table.setHorizontalHeaderLabels(COLS)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self._table.horizontalHeader().setSectionResizeMode(
             COL_CHECK, QHeaderView.ResizeMode.ResizeToContents
         )
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         # 允许双击编辑（具体哪些列可编辑通过 item flags 控制）
         self._table.setEditTriggers(
             QAbstractItemView.EditTrigger.DoubleClicked |
@@ -243,10 +261,22 @@ class _RuleTab(QWidget):
         btn_del.setStyleSheet("background:#e74c3c;color:white;padding:4px 14px;")
         btn_add.clicked.connect(self._add_entry)
         btn_del.clicked.connect(self._del_entry)
+        btn_on  = QPushButton("启用选中")
+        btn_off = QPushButton("停用选中")
+        btn_on.setStyleSheet("background:#27ae60;color:white;padding:4px 14px;")
+        btn_off.setStyleSheet("background:#7f8c8d;color:white;padding:4px 14px;")
+        btn_on.clicked.connect(lambda: self._set_selected_enabled(True))
+        btn_off.clicked.connect(lambda: self._set_selected_enabled(False))
         btn_row.addWidget(btn_add)
+        btn_row.addWidget(btn_on)
+        btn_row.addWidget(btn_off)
         btn_row.addWidget(btn_del)
         btn_row.addStretch()
-        tip = QLabel("提示：双击「名称」或「域名」单元格可直接修改")
+        QShortcut(QKeySequence(QKeySequence.StandardKey.Delete), self._table,
+                  activated=self._del_entry,
+                  context=Qt.ShortcutContext.WidgetShortcut)
+        tip = QLabel("提示：Ctrl / Shift 多选，双击名称或域名可修改")
+        tip.setWordWrap(True)
         tip.setStyleSheet("color:gray;font-size:11px;")
         btn_row.addWidget(tip)
         layout.addLayout(btn_row)
@@ -263,7 +293,12 @@ class _RuleTab(QWidget):
 
         if col == COL_CHECK:
             enabled = item.checkState() == Qt.CheckState.Checked
-            self._set_enabled_fn(row_id, enabled)
+            rows = self._selected_rows()
+            if row in rows and len(rows) > 1:
+                # 点的是多选中的一行 → 整个选区统一设为该状态
+                self._apply_enabled(rows, enabled)
+            else:
+                self._set_enabled_fn(row_id, enabled)
             self.changed.emit()
             return
 
@@ -284,6 +319,35 @@ class _RuleTab(QWidget):
                 self.reload()
                 return
             self.changed.emit()
+
+    def _selected_rows(self) -> set[int]:
+        return {idx.row() for idx in self._table.selectionModel().selectedRows()}
+
+    def _apply_enabled(self, rows, enabled: bool):
+        state = Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked
+        self._table.blockSignals(True)
+        try:
+            for r in rows:
+                chk = self._table.item(r, COL_CHECK)
+                domain_item = self._table.item(r, COL_DOMAIN)
+                if not chk or not domain_item:
+                    continue
+                row_id = domain_item.data(Qt.ItemDataRole.UserRole)
+                if row_id is None:
+                    continue
+                if chk.checkState() != state:
+                    chk.setCheckState(state)
+                self._set_enabled_fn(row_id, enabled)
+        finally:
+            self._table.blockSignals(False)
+
+    def _set_selected_enabled(self, enabled: bool):
+        rows = self._selected_rows()
+        if not rows:
+            QMessageBox.information(self, "提示", "请先选中要操作的条目（可用 Ctrl / Shift 多选）")
+            return
+        self._apply_enabled(rows, enabled)
+        self.changed.emit()
 
     def _add_entry(self):
         dlg = _AddDialog(self._add_dialog_title, self, allow_discover=self._allow_discover)
@@ -324,7 +388,7 @@ class _RuleTab(QWidget):
         self.changed.emit()
 
     def _del_entry(self):
-        rows = set(idx.row() for idx in self._table.selectedIndexes())
+        rows = self._selected_rows()
         if not rows:
             return
         reply = QMessageBox.question(self, "确认", f"删除选中的 {len(rows)} 条记录？")
