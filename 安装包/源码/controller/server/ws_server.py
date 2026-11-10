@@ -125,8 +125,9 @@ class ControllerServer:
         raw = msg_set_filter(enabled, mode)
         await self._broadcast(raw, target_ip)
 
-    async def disconnect_internet(self, target_ip: str | None = None):
-        await self._broadcast(msg_disconnect(), target_ip)
+    async def disconnect_internet(self, target_ip: str | None = None,
+                                  lan_subnets: list[str] | None = None):
+        await self._broadcast(msg_disconnect(lan_subnets), target_ip)
 
     async def reconnect_internet(self, target_ip: str | None = None):
         await self._broadcast(msg_reconnect(), target_ip)

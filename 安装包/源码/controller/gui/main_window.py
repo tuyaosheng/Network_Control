@@ -391,7 +391,7 @@ class MainWindow(QMainWindow):
                 )
                 await self.server.set_filter(True, MODE_BLACKLIST, ip)
         elif state == "disconnect":
-            await self.server.disconnect_internet(ip)
+            await self.server.disconnect_internet(ip, lan_subnets)
         else:
             # normal 或未知：明确放行（被控端开机默认断网，需主控端确认才上网）
             await self.server.reconnect_internet(ip)
@@ -490,10 +490,11 @@ class MainWindow(QMainWindow):
 
     def _on_disconnect(self, ips: list[str]):
         targets = ips if ips else [None]
+        lan_subnets, _ = self._get_lan_upstream()
 
         async def _do():
             for ip in targets:
-                await self.server.disconnect_internet(ip)
+                await self.server.disconnect_internet(ip, lan_subnets)
 
         self._run_async(_do())
         # 保存状态，用于被控端重连后自动恢复

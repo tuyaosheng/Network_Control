@@ -243,6 +243,18 @@ def _get_default_gateways() -> list[dict]:
         return []
 
 
+def _load_gw_backup() -> list[dict]:
+    """读取 _delete_default_route() 备份的默认路由；没有或损坏时返回 []。"""
+    try:
+        with open(_gw_backup_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    return data if isinstance(data, list) else []
+
+
 def _ps_metric_arg(metric) -> str:
     """RouteMetric=0 表示 Windows 自动跃点，New-NetRoute 部分版本拒绝 0，省略以使用默认值。"""
     try:
@@ -422,7 +434,10 @@ def disconnect_internet(controller_ip: str = "", lan_subnets: list[str] | None =
     _clean_whitelist_routes()   # 状态切换时才清理白名单路由
     if controller_ip or lan_subnets:
         _refresh_onlink_nets()  # 主控端若与本机同网段，下面会跳过加主机路由
-        gws = _get_default_gateways()
+        # 已在断网/白名单状态时默认路由早被删了（开机断网后主控端再下发断网、
+        # 白名单切断网、连点两次禁止上网），上面刚清掉的局域网/主控端路由
+        # 要按删路由时备份的网关重建，否则跨网段的局域网和主控端就此失联
+        gws = _get_default_gateways() or _load_gw_backup()
         if gws:
             gw     = gws[0]
             gw_ip  = gw.get("NextHop", "")

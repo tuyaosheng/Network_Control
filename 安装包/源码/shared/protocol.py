@@ -79,8 +79,10 @@ def msg_update_rules(domains: list[str], lan_subnets: list[str],
 def msg_set_filter(enabled: bool, mode: str = MODE_WHITELIST) -> str:
     return make_msg(MSG_SET_FILTER, enabled=enabled, mode=mode)
 
-def msg_disconnect() -> str:
-    return make_msg(MSG_DISCONNECT)
+def msg_disconnect(lan_subnets: list[str] | None = None) -> str:
+    """lan_subnets：断网期间仍保持可达的局域网段（跨网段会加路由）。
+    空列表表示不改，被控端沿用本地配置。"""
+    return make_msg(MSG_DISCONNECT, lan_subnets=lan_subnets or [])
 
 def msg_reconnect() -> str:
     return make_msg(MSG_RECONNECT)

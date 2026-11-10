@@ -164,7 +164,9 @@ class AgentWSClient:
             self.filter_active = False
             self._net_state    = "disconnect"
             if self.on_disconnect:
-                await asyncio.get_event_loop().run_in_executor(None, self.on_disconnect)
+                await asyncio.get_event_loop().run_in_executor(
+                    None, self.on_disconnect, msg.get("lan_subnets", [])
+                )
             await ws.send(msg_ack(True, "已断网（局域网保留）"))
 
         elif t == MSG_RECONNECT:

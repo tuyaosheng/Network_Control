@@ -107,7 +107,7 @@ class AgentCore:
         else:
             self._blacklist_domains = domains
 
-        self._lan_subnets = lan_subnets or self._lan_subnets
+        self._set_lan_subnets(lan_subnets)
         self._controller_ip = controller_ip
         self._upstream_dns = upstream_dns or self._upstream_dns
 
@@ -141,7 +141,23 @@ class AgentCore:
             state = self.STATE_NORMAL
         self._set_state(state)
 
-    def _on_disconnect(self):
+    def _set_lan_subnets(self, lan_subnets: list[str] | None):
+        """采用主控端下发的局域网段并写回 config.json。
+        开机 fail-closed 断网时主控端还没连上，只能读本地配置——不落盘的话，
+        老师改了局域网段，学生机重启后的断网阶段仍按旧网段加路由。
+        空列表表示主控端没给（旧版主控端），沿用本地值。"""
+        if not lan_subnets or lan_subnets == self._lan_subnets:
+            return
+        self._lan_subnets = list(lan_subnets)
+        self.config["lan_subnets"] = self._lan_subnets
+        try:
+            save_config(self.config)
+            logger.info(f"局域网段已更新并写入 config.json: {self._lan_subnets}")
+        except Exception as e:
+            logger.warning(f"局域网段写入 config.json 失败: {e}")
+
+    def _on_disconnect(self, lan_subnets: list[str] | None = None):
+        self._set_lan_subnets(lan_subnets)
         self._set_state(self.STATE_DISCONNECT)
 
     def _on_reconnect(self):
