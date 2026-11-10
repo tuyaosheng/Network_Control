@@ -14,7 +14,7 @@ import websockets
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from shared.protocol import (
     MSG_UPDATE_RULES, MSG_GET_STATUS, MSG_SET_FILTER,
-    MSG_DISCONNECT, MSG_RECONNECT, MSG_BROWSING_UPDATE,
+    MSG_DISCONNECT, MSG_RECONNECT, MSG_BROWSING_UPDATE, MSG_INPUT_LOCK,
     MODE_WHITELIST,
     msg_register, msg_heartbeat, msg_status, msg_ack,
     msg_browsing_update, parse_msg
@@ -50,8 +50,12 @@ class AgentWSClient:
                  on_disconnect: Callable | None = None,
                  on_reconnect: Callable | None = None,
                  get_status_fn: Callable | None = None,
-                 get_browsing_fn: Callable | None = None):
+                 get_browsing_fn: Callable | None = None,
+                 on_input_lock: Callable | None = None,
+                 get_blocked_fn: Callable | None = None):
         self.url            = controller_url
+        self.on_input_lock   = on_input_lock
+        self.get_blocked_fn  = get_blocked_fn
         self.on_update_rules = on_update_rules
         self.on_set_filter   = on_set_filter
         self.on_disconnect   = on_disconnect
@@ -63,6 +67,7 @@ class AgentWSClient:
         self.connected     = False
         self.filter_active = False
         self._net_state    = "normal"
+        self._input_locked = False
 
     async def run(self):
         while not self._stop:
@@ -106,7 +111,8 @@ class AgentWSClient:
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
             try:
-                await ws.send(msg_heartbeat(self.filter_active, self._net_state))
+                await ws.send(msg_heartbeat(self.filter_active, self._net_state,
+                                            self._input_locked))
             except Exception:
                 break
 
@@ -117,8 +123,9 @@ class AgentWSClient:
                 continue
             try:
                 domains = self.get_browsing_fn()
-                if domains:
-                    await ws.send(msg_browsing_update(domains))
+                blocked = self.get_blocked_fn() if self.get_blocked_fn else []
+                if domains or blocked:
+                    await ws.send(msg_browsing_update(domains, blocked))
             except Exception:
                 break
 
@@ -167,13 +174,21 @@ class AgentWSClient:
                 await asyncio.get_event_loop().run_in_executor(None, self.on_reconnect)
             await ws.send(msg_ack(True, "已恢复上网"))
 
+        elif t == MSG_INPUT_LOCK:
+            on = bool(msg.get("on", False))
+            self._input_locked = on
+            if self.on_input_lock:
+                await asyncio.get_event_loop().run_in_executor(None, self.on_input_lock, on)
+            await ws.send(msg_ack(True, "键鼠已锁定" if on else "键鼠已解锁"))
+
         elif t == MSG_GET_STATUS:
             s = self.get_status_fn() if self.get_status_fn else {}
             await ws.send(msg_status(
                 filter_active=s.get("filter_active", False),
                 dns_running=s.get("dns_running", False),
                 rule_count=s.get("rule_count", 0),
-                net_state=s.get("net_state", "normal")
+                net_state=s.get("net_state", "normal"),
+                input_locked=s.get("input_locked", False),
             ))
 
     def stop(self):

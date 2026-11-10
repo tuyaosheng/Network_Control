@@ -18,7 +18,7 @@ from shared.protocol import (
     MSG_REGISTER, MSG_HEARTBEAT, MSG_STATUS, MSG_ACK, MSG_BROWSING_UPDATE,
     MODE_WHITELIST, MODE_BLACKLIST,
     parse_msg, msg_update_rules, msg_set_filter,
-    msg_disconnect, msg_reconnect, msg_get_status
+    msg_disconnect, msg_reconnect, msg_get_status, msg_input_lock
 )
 
 logger = logging.getLogger("ws_server")
@@ -45,6 +45,8 @@ class ConnectedAgent:
         self.mac           = ""
         self.filter_active = False
         self.net_state     = "normal"
+        self.input_locked  = False
+        self.blocked: dict[str, dict] = {}   # 白名单期间被拦截的域名累计（被控端快照整体替换）
         self.is_online     = True
         self.connected_at  = datetime.now()
         self.last_seen     = datetime.now()
@@ -57,6 +59,7 @@ class ConnectedAgent:
             "mac":            self.mac,
             "filter_active":  self.filter_active,
             "net_state":      self.net_state,
+            "input_locked":   self.input_locked,
             "is_online":      self.is_online,
             "connected_at":   self.connected_at.strftime("%H:%M:%S"),
             "last_seen":      self.last_seen.strftime("%H:%M:%S"),
@@ -76,6 +79,7 @@ class ControllerServer:
         self._agents: dict[str, ConnectedAgent]         = {}   # 在线
         self._offline: dict[str, ConnectedAgent]        = {}   # 曾连接但已断开
         self._saved_states: dict[str, str]              = initial_states or {}
+        self._saved_input_lock: set[str]                = set()   # 老师锁了键鼠的 IP（重连恢复用）
         self._lock   = asyncio.Lock()
         self._server = None
 
@@ -102,10 +106,7 @@ class ControllerServer:
         多网卡教师机（有线+无线 / VPN / 虚拟网卡）若统一用 connect("8.8.8.8") 猜，
         会把朝互联网那张网卡的 IP 发下去，被控端断网后按错误 IP 加主机路由就连不回来了。"""
         async with self._lock:
-            targets = (
-                [self._agents[target_ip]] if target_ip and target_ip in self._agents
-                else list(self._agents.values())
-            )
+            targets = self._resolve_targets(target_ip)
         fallback = self._get_local_ip()
         failed = []
         for agent in targets:
@@ -130,17 +131,52 @@ class ControllerServer:
     async def reconnect_internet(self, target_ip: str | None = None):
         await self._broadcast(msg_reconnect(), target_ip)
 
+    async def set_input_lock(self, on: bool, target_ip: str | None = None):
+        """锁定 / 解锁键盘鼠标。target_ip 为空 = 全部在线被控端。"""
+        await self._broadcast(msg_input_lock(on), target_ip)
+
+    def update_saved_input_lock(self, ips: list[str], on: bool):
+        for ip in ips:
+            (self._saved_input_lock.add if on else self._saved_input_lock.discard)(ip)
+
+    def is_input_lock_saved(self, ip: str) -> bool:
+        return ip in self._saved_input_lock
+
+    def get_blocked_summary(self) -> list[dict]:
+        """汇总各被控端白名单期间被拦截的域名：[{domain, count, machines, ts}]，按次数降序。"""
+        agg: dict[str, dict] = {}
+        for a in list(self._agents.values()) + list(self._offline.values()):
+            for d, rec in list(a.blocked.items()):
+                x = agg.setdefault(d, {"domain": d, "count": 0, "machines": 0, "ts": ""})
+                x["count"] += rec.get("count", 0)
+                x["machines"] += 1
+                x["ts"] = max(x["ts"], rec.get("ts", ""))
+        return sorted(agg.values(), key=lambda r: (-r["count"], r["domain"]))
+
+    def clear_blocked(self):
+        for a in list(self._agents.values()) + list(self._offline.values()):
+            a.blocked.clear()
+
     async def request_status(self, target_ip: str | None = None):
         await self._broadcast(msg_get_status(), target_ip)
 
     # ── 内部逻辑 ─────────────────────────────────────────────────
 
+    def _resolve_targets(self, target_ip: str | None) -> list[ConnectedAgent]:
+        """target_ip 为空 → 全部在线；指定了 IP → 只发给它，不在线就一个都不发。
+        （旧逻辑在 IP 不在线时退化成广播：按 IP 禁一台已关机的学生机会让全班断网。
+        不在线的机器由调用方保存的权威状态在它上线注册时恢复。）调用方须持有 self._lock。"""
+        if not target_ip:
+            return list(self._agents.values())
+        agent = self._agents.get(target_ip)
+        if agent is None:
+            logger.info(f"目标 {target_ip} 不在线，暂不下发（上线后按保存的状态恢复）")
+            return []
+        return [agent]
+
     async def _broadcast(self, raw: str, target_ip: str | None):
         async with self._lock:
-            targets = (
-                [self._agents[target_ip]] if target_ip and target_ip in self._agents
-                else list(self._agents.values())
-            )
+            targets = self._resolve_targets(target_ip)
         failed = []
         for agent in targets:
             try:
@@ -221,12 +257,15 @@ class ControllerServer:
         elif t in (MSG_HEARTBEAT, MSG_STATUS):
             agent.filter_active = msg.get("filter_active", False)
             agent.net_state     = msg.get("net_state", "normal")
+            agent.input_locked  = msg.get("input_locked", agent.input_locked)
             self._notify_change()
 
         elif t == MSG_BROWSING_UPDATE:
             domains = msg.get("domains", [])
             for d in domains:
                 agent.recent_domains.append(d)
+            if "blocked" in msg:
+                agent.blocked = {r["domain"]: r for r in msg["blocked"] if r.get("domain")}
             self._notify_change()
 
         elif t == MSG_ACK:

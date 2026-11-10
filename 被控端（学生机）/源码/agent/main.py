@@ -84,9 +84,17 @@ class AgentCore:
         # 浏览记录（DNS 查询日志）
         self._recent_domains: collections.deque = collections.deque(maxlen=50)
         self._domains_lock = threading.Lock()
+        self._blocked: dict[str, dict] = {}   # 白名单模式被拦截的域名累计
         # 网络监控
         self._lock_screen_pid: int | None = None
         self._network_was_up: bool = True
+        # 状态切换锁：主控端指令（ws 线程池）和路由守护（监控循环）都会切状态，
+        # 可重入是因为 _enforce_lockdown 持锁时还要调 _set_state
+        self._state_lock = threading.RLock()
+        # 键鼠锁定（教师主控端下发；不持久化，被控端重启后由主控端重连恢复时再下发）
+        self._input_locked: bool = False
+        self._input_lock_pid: int | None = None
+        self._input_lock_mutex = threading.Lock()
 
     # ── 规则更新 ──────────────────────────────────────────────────
 
@@ -142,29 +150,49 @@ class AgentCore:
     # ── 状态机 ────────────────────────────────────────────────────
 
     def _set_state(self, new_state: str):
-        old = self._net_state
-        self._net_state = new_state
-        self.filter_active = new_state in (self.STATE_WHITELIST, self.STATE_BLACKLIST)
+        with self._state_lock:
+            old = self._net_state
+            self._net_state = new_state
+            self.filter_active = new_state in (self.STATE_WHITELIST, self.STATE_BLACKLIST)
 
-        if self.tray:
-            self.tray.set_net_state(new_state)
+            if self.tray:
+                self.tray.set_net_state(new_state)
 
-        dispatch = {
-            self.STATE_NORMAL:     self._do_restore,
-            self.STATE_WHITELIST:  self._do_enable_whitelist,
-            self.STATE_BLACKLIST:  self._do_enable_blacklist,
-            self.STATE_DISCONNECT: self._do_disconnect,
-        }
-        dispatch.get(new_state, self._do_restore)()
-        logger.info(f"状态: {old} → {new_state}")
+            dispatch = {
+                self.STATE_NORMAL:     self._do_restore,
+                self.STATE_WHITELIST:  self._do_enable_whitelist,
+                self.STATE_BLACKLIST:  self._do_enable_blacklist,
+                self.STATE_DISCONNECT: self._do_disconnect,
+            }
+            dispatch.get(new_state, self._do_restore)()
+            logger.info(f"状态: {old} → {new_state}")
+
+    def _enforce_lockdown(self) -> bool:
+        """路由守护：断网 / 白名单都靠"删默认路由"切断互联网，但系统会把它加回来——
+        Windows 网络疑难解答（DPS 服务执行，普通用户即可触发）、拔插网线、DHCP 续约。
+        发现默认路由重新出现就按当前状态重做一遍。返回是否做了修复。
+
+        在状态锁内检查：白名单建立过程中会临时恢复默认路由，持锁可避免把这个中间态误判为被篡改。"""
+        with self._state_lock:
+            state = self._net_state
+            if state not in (self.STATE_DISCONNECT, self.STATE_WHITELIST):
+                return False
+            if not has_internet_route():
+                return False
+            logger.warning(f"检测到默认路由被恢复（网络疑难解答 / 拔插网线 / DHCP 续约等），重新进入 {state}")
+            self._set_state(state)
+            return True
 
     def _do_enable_whitelist(self):
         self._stop_dns()
+        with self._domains_lock:
+            self._blocked.clear()   # 新一轮白名单，旧的拦截统计作废
         self.dns_server = LocalDNSServer(
             domains=self._whitelist_domains,
             upstream_dns=self._upstream_dns,
             mode=MODE_WHITELIST,
             on_query=self._on_query_domain,
+            on_blocked=self._on_blocked_domain,
             # DNS 服务器每次解析白名单域名后，把上游返回的 IP 实时加进路由表
             # 这样 CDN 每次返回的不同 IP 都能被放行，浏览器拿到的 IP 一定可达
             on_resolved_ips=add_host_routes_dynamic,
@@ -194,7 +222,7 @@ class AgentCore:
         set_adapter_dns(self._upstream_dns)
         remove_all_rules()       # 清掉白名单模式可能留下的防火墙规则
         # 传主控端 IP：删默认路由前先保留到主控端的路由，断网后仍能被主控端管理/放行
-        disconnect_internet(self._controller_ip)
+        disconnect_internet(self._controller_ip, self._lan_subnets)
 
     def _do_restore(self):
         self._stop_dns()
@@ -220,6 +248,22 @@ class AgentCore:
         with self._domains_lock:
             return list(self._recent_domains)
 
+    def _on_blocked_domain(self, domain: str):
+        with self._domains_lock:
+            d = domain.lower()
+            rec = self._blocked.get(d)
+            if rec is None:
+                if len(self._blocked) >= 200:   # 防止异常域名洪水撑爆内存
+                    return
+                rec = self._blocked[d] = {"domain": d, "count": 0, "ts": ""}
+            rec["count"] += 1
+            rec["ts"] = datetime.now().strftime("%H:%M:%S")
+
+    def _get_blocked_domains(self) -> list:
+        """白名单期间被拦截域名的累计快照（主控端按 IP 整体替换，不会重复累加）。"""
+        with self._domains_lock:
+            return list(self._blocked.values())
+
     # ── 状态上报 ─────────────────────────────────────────────────
 
     def _get_status(self) -> dict:
@@ -228,6 +272,7 @@ class AgentCore:
             "net_state":     self._net_state,
             "dns_running":   self.dns_server.running if self.dns_server else False,
             "rule_count":    len(self._whitelist_domains) + len(self._blacklist_domains),
+            "input_locked":  self._input_locked,
         }
 
     # ── 网络监控（拔网线检测）────────────────────────────────────
@@ -254,6 +299,18 @@ class AgentCore:
                     if not self._is_process_alive(self._lock_screen_pid):
                         logger.info("锁屏进程退出，重新启动")
                         self._lock_screen_pid = self._launch_lock_screen()
+
+                # 键鼠锁定守护：钩子进程被结束 / 秒退 / 换了用户会话就重新注入
+                if self._input_locked:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, self._guard_input_lock
+                    )
+
+                # 路由守护：断网 / 白名单状态下默认路由被系统加回来就重新断开
+                if up:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, self._enforce_lockdown
+                    )
             except Exception as e:
                 logger.debug(f"网络监控异常: {e}")
 
@@ -288,18 +345,30 @@ class AgentCore:
         except Exception as e:
             logger.warning(f"关闭锁屏进程失败: {e}")
 
-    def _launch_lock_screen(self) -> int | None:
-        unlock_hash = self.config.get("unlock_password_hash",
-                                       hashlib.sha256(b"admin123").hexdigest())
-        exe = sys.executable
+    @staticmethod
+    def _self_cmd(*args: str) -> list[str]:
+        """本程序的子模式命令行：打包后是 CTR.exe <args>，调试时是 python windows_service.py <args>。"""
+        if getattr(sys, "frozen", False):
+            return [sys.executable, *args]
+        entry = os.path.join(os.path.dirname(__file__), "service", "windows_service.py")
+        return [sys.executable, entry, *args]
 
-        # 服务模式（SYSTEM 权限）：通过 WTS API 跨 Session 在用户桌面启动锁屏
+    def _launch_in_user_session(self, args: list[str], tag: str,
+                                as_system: bool = False) -> int | None:
+        """在当前登录用户的桌面启动本程序的子模式（锁屏 / 键鼠锁定）。
+
+        服务模式（SYSTEM）：通过 WTS API 跨 Session 注入。as_system=True 时进程用 SYSTEM 令牌
+        （改 SessionId 到用户会话），学生杀不掉；否则用用户令牌。
+        debug 模式或权限不足（1314）：已在用户 Session 中，降级为直接 Popen。"""
+        cmd_list = self._self_cmd(*args)
+        exe = cmd_list[0]
         try:
             import win32ts
             import win32process
             import win32security
             import win32con
             import win32api
+            import win32profile
 
             session_id = win32ts.WTSGetActiveConsoleSessionId()
             if session_id == 0xFFFFFFFF:
@@ -308,19 +377,27 @@ class AgentCore:
             user_token = win32ts.WTSQueryUserToken(session_id)
             # pywin32 签名: DuplicateTokenEx(ExistingToken, ImpersonationLevel,
             #   DesiredAccess, TokenType, TokenAttributes=None)
-            primary_token = win32security.DuplicateTokenEx(
-                user_token,
-                win32security.SecurityImpersonation,  # ImpersonationLevel
-                win32con.TOKEN_ALL_ACCESS,            # DesiredAccess
-                win32security.TokenPrimary,           # TokenType
-            )
+            if as_system:
+                own = win32security.OpenProcessToken(
+                    win32api.GetCurrentProcess(), win32con.TOKEN_ALL_ACCESS)
+                primary_token = win32security.DuplicateTokenEx(
+                    own, win32security.SecurityImpersonation,
+                    win32con.TOKEN_ALL_ACCESS, win32security.TokenPrimary)
+                win32security.SetTokenInformation(
+                    primary_token, win32security.TokenSessionId, session_id)
+            else:
+                primary_token = win32security.DuplicateTokenEx(
+                    user_token,
+                    win32security.SecurityImpersonation,  # ImpersonationLevel
+                    win32con.TOKEN_ALL_ACCESS,            # DesiredAccess
+                    win32security.TokenPrimary,           # TokenType
+                )
             si = win32process.STARTUPINFO()
             si.lpDesktop = "winsta0\\default"
-            cmd = f'"{exe}" --lock "{unlock_hash}"'
+            cmd = subprocess.list2cmdline(cmd_list)
 
             # 必须传【用户】环境块：否则子进程继承 SYSTEM 环境，PyInstaller 单文件解压到
-            # SYSTEM 的 %TEMP%（用户令牌无权写）、Qt 取不到用户环境，锁屏进程会一启动就秒退。
-            import win32profile
+            # SYSTEM 的 %TEMP%（用户令牌无权写）、Qt 取不到用户环境，进程会一启动就秒退。
             try:
                 env = win32profile.CreateEnvironmentBlock(user_token, False)
             except Exception:
@@ -335,22 +412,60 @@ class AgentCore:
             pid = info[2]
             win32api.CloseHandle(info[0])
             win32api.CloseHandle(info[1])
-            logger.info(f"锁屏进程已启动 PID={pid}")
+            logger.info(f"{tag}进程已启动 PID={pid}")
             return pid
         except Exception as e:
-            # debug 模式或非 SYSTEM 权限（1314）：已在用户 Session 中，直接 Popen
-            logger.warning(f"WTS 方式启动锁屏失败({e})，降级为当前会话直接启动")
+            logger.warning(f"WTS 方式启动{tag}失败({e})，降级为当前会话直接启动")
 
         try:
-            proc = subprocess.Popen(
-                [exe, "--lock", unlock_hash],
-                creationflags=subprocess.CREATE_NEW_CONSOLE
-            )
-            logger.info(f"锁屏进程已启动(降级模式) PID={proc.pid}")
+            proc = subprocess.Popen(cmd_list, creationflags=subprocess.CREATE_NEW_CONSOLE)
+            logger.info(f"{tag}进程已启动(降级模式) PID={proc.pid}")
             return proc.pid
         except Exception as e2:
-            logger.error(f"启动锁屏失败: {e2}")
+            logger.error(f"启动{tag}失败: {e2}")
             return None
+
+    def _launch_lock_screen(self) -> int | None:
+        unlock_hash = self.config.get("unlock_password_hash",
+                                       hashlib.sha256(b"admin123").hexdigest())
+        return self._launch_in_user_session(["--lock", unlock_hash], "锁屏")
+
+    # ── 键盘鼠标锁定 ─────────────────────────────────────────────
+
+    @staticmethod
+    def _kill_by_cmdline(marker: str):
+        """按命令行关闭全部匹配进程（单文件 exe 有父+子进程，只杀一个 PID 关不掉）。"""
+        ps = ("Get-CimInstance Win32_Process | Where-Object "
+              f"{{ $_.CommandLine -like '*{marker}*' -and $_.ProcessId -ne $PID }} | "
+              "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }")
+        subprocess.run(['powershell', '-NonInteractive', '-Command', ps],
+                       capture_output=True, timeout=15,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+
+    def _on_input_lock(self, on: bool):
+        with self._input_lock_mutex:
+            self._input_locked = on
+            if on:
+                self._ensure_input_lock_process()
+            else:
+                self._input_lock_pid = None
+                try:
+                    self._kill_by_cmdline("--input-lock")
+                except Exception as e:
+                    logger.warning(f"解除键鼠锁定失败: {e}")
+            logger.info(f"键鼠锁定: {'开' if on else '关'}")
+
+    def _guard_input_lock(self):
+        with self._input_lock_mutex:
+            if self._input_locked:
+                self._ensure_input_lock_process()
+
+    def _ensure_input_lock_process(self):
+        """锁定中但钩子进程不在（被杀 / 秒退 / 用户会话切换）就重新注入。"""
+        if self._input_lock_pid and self._is_process_alive(self._input_lock_pid):
+            return
+        self._input_lock_pid = self._launch_in_user_session(
+            ["--input-lock", str(os.getpid())], "键鼠锁定", as_system=True)
 
     def _is_process_alive(self, pid: int) -> bool:
         try:
@@ -368,6 +483,7 @@ class AgentCore:
 
     def _on_exit_confirmed(self):
         logger.info("用户通过托盘密码验证，退出程序")
+        self._on_input_lock(False)
         self._do_restore()
         os._exit(0)
 
@@ -420,8 +536,10 @@ class AgentCore:
             on_set_filter=self._on_set_filter,
             on_disconnect=self._on_disconnect,
             on_reconnect=self._on_reconnect,
+            on_input_lock=self._on_input_lock,
             get_status_fn=self._get_status,
-            get_browsing_fn=self._get_recent_domains
+            get_browsing_fn=self._get_recent_domains,
+            get_blocked_fn=self._get_blocked_domains,
         )
 
         try:
@@ -430,12 +548,14 @@ class AgentCore:
                 self._monitor_network()
             )
         finally:
+            self._on_input_lock(False)
             self._do_restore()
             self.tray.stop()
 
     def stop(self):
         if self.ws_client:
             self.ws_client.stop()
+        self._on_input_lock(False)
         self._do_restore()
 
 

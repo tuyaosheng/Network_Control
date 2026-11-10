@@ -133,6 +133,7 @@ class MachinePanel(QWidget):
     sig_start_blacklist = pyqtSignal(list)   # 启动黑名单过滤
     sig_disconnect      = pyqtSignal(list)   # 禁止上网（保留局域网）
     sig_scan            = pyqtSignal(str)    # 扫描 IP 段
+    sig_input_lock      = pyqtSignal(list, bool)   # 锁定(True)/解锁(False)键盘鼠标
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -182,6 +183,18 @@ class MachinePanel(QWidget):
 
         for w in (btn_allow, btn_whitelist, btn_blacklist, btn_disconnect):
             ab.addWidget(w)
+
+        btn_kb_lock   = QPushButton("🔒 锁键鼠")
+        btn_kb_unlock = QPushButton("🔓 解键鼠")
+        for btn, col in [(btn_kb_lock, "#7d3c98"), (btn_kb_unlock, "#5d6d7e")]:
+            btn.setStyleSheet(
+                f"background:{col};color:white;font-weight:bold;"
+                "padding:8px 14px;border-radius:4px;font-size:13px;"
+            )
+            btn.setMinimumHeight(36)
+            ab.addWidget(btn)
+        btn_kb_lock.clicked.connect(lambda: self._emit_input_lock(True))
+        btn_kb_unlock.clicked.connect(lambda: self._emit_input_lock(False))
         ab.addStretch()
 
         # ── 扫描行 ──────────────────────────────────────────────────
@@ -366,6 +379,17 @@ class MachinePanel(QWidget):
         else:
             signal.emit(list(checked_online))
 
+    def _emit_input_lock(self, on: bool):
+        """与 _emit_targeted 同一套目标规则（未勾选 / 全选 = 全部在线，否则只对勾选的）。"""
+        online = self._online_ips()
+        if not online:
+            return
+        checked_online = self._checked_ips & online
+        if not checked_online or checked_online >= online:
+            self.sig_input_lock.emit([], on)
+        else:
+            self.sig_input_lock.emit(list(checked_online), on)
+
     # ── 右键菜单 ─────────────────────────────────────────────────────
 
     def _show_context_menu(self, pos):
@@ -442,7 +466,8 @@ class MachinePanel(QWidget):
                 self._set_cell(row, COL_CHECK,  "", is_online, checkable=True)
                 self._set_cell(row, COL_IP,     ip, is_online)
                 self._set_cell(row, COL_HOST,   a.get("hostname", ""), is_online)
-                self._set_cell(row, COL_STATE,  f"● {label}", is_online, fg=color)
+                lock_mark = " 🔒" if is_online and a.get("input_locked") else ""
+                self._set_cell(row, COL_STATE,  f"● {label}{lock_mark}", is_online, fg=color)
                 self._set_cell(row, COL_CONN,   a.get("connected_at", ""), is_online)
                 self._set_cell(row, COL_LAST,   a.get("last_seen", ""), is_online)
                 self._set_cell(row, COL_BROWSE, last_txt, is_online)

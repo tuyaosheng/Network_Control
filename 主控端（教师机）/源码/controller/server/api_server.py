@@ -1,5 +1,6 @@
 """
-主控端 HTTP 控制接口 - 供外部程序调用，实现「一键开网 / 一键禁网」
+主控端 HTTP 控制接口 - 供外部程序调用，实现「一键开网 / 一键禁网 / 启动白名单 / 启动黑名单」
+（均支持全部或按 IP 单台）
 
 设计要点：
 - 用 Python 标准库 http.server，独立 daemon 线程运行，零额外依赖。
@@ -29,6 +30,11 @@ class ControlAPIServer:
         on_disable:    禁网回调（无参），同上。
         on_enable_ip:  按 IP 开单台回调（参数为 IP 字符串），同上。供学习平台使用。
         on_disable_ip: 按 IP 禁单台回调（参数为 IP 字符串），同上。供学习平台同步状态使用。
+        on_whitelist:  启动白名单回调（参数为 IP，空串 = 全部在线被控端），同上。
+        on_blacklist:  启动黑名单回调（参数同上），同上。
+        on_input_lock: 锁定/解锁键盘鼠标回调（参数为 逗号分隔的 IP 串、是否锁定；IP 串为空 = 全部在线被控端），同上。
+        count_rules:   返回某模式（"whitelist" / "blacklist"）已启用规则条数，
+                       名单为空时接口直接报错，不下发（界面上的提示框在接口调用时没人看）。
         get_status:    返回状态的回调，返回可 JSON 序列化对象（如被控端列表）。
     """
 
@@ -37,6 +43,10 @@ class ControlAPIServer:
                  on_disable: Optional[Callable[[], None]] = None,
                  on_enable_ip: Optional[Callable[[str], None]] = None,
                  on_disable_ip: Optional[Callable[[str], None]] = None,
+                 on_whitelist: Optional[Callable[[str], None]] = None,
+                 on_blacklist: Optional[Callable[[str], None]] = None,
+                 count_rules: Optional[Callable[[str], int]] = None,
+                 on_input_lock: Optional[Callable[[str, bool], None]] = None,
                  get_status: Optional[Callable[[], object]] = None):
         self.host          = host
         self.port          = port
@@ -45,6 +55,10 @@ class ControlAPIServer:
         self.on_disable    = on_disable
         self.on_enable_ip  = on_enable_ip
         self.on_disable_ip = on_disable_ip
+        self.on_whitelist  = on_whitelist
+        self.on_blacklist  = on_blacklist
+        self.count_rules   = count_rules
+        self.on_input_lock = on_input_lock
         self.get_status    = get_status
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread]   = None
@@ -208,6 +222,57 @@ class ControlAPIServer:
                         outer.on_disable_ip(ip)
                     self._send(202, {"ok": True, "action": "disable_ip", "ip": ip,
                                      "message": f"已下发『禁止上网』指令: {ip}"})
+                    return
+
+                # 启动白名单 / 黑名单：全部 或 按 IP 单台
+                for mode, label, callback in (
+                    ("whitelist", "白名单", outer.on_whitelist),
+                    ("blacklist", "黑名单", outer.on_blacklist),
+                ):
+                    by_ip = path in (f"/api/network/{mode}_ip", f"/api/{mode}_ip", f"/{mode}_ip")
+                    if not by_ip and path not in (f"/api/network/{mode}", f"/api/{mode}", f"/{mode}"):
+                        continue
+                    ip = (query.get("ip", [""])[0] or "").strip() if by_ip else ""
+                    if by_ip and not ip:
+                        self._send(400, {"ok": False, "error": "missing ip"})
+                        return
+                    count = None
+                    if outer.count_rules:
+                        try:
+                            count = outer.count_rules(mode)
+                        except Exception as e:
+                            logger.warning(f"读取{label}规则数失败: {e}")
+                    if count == 0:
+                        self._send(409, {"ok": False, "error": f"{mode} empty",
+                                         "message": f"{label}为空，请先在主控端「规则管理 → {label}」中添加并启用域名"})
+                        return
+                    if callback:
+                        callback(ip)
+                    action = f"{mode}_ip" if by_ip else mode
+                    target = f": {ip}" if by_ip else "（全部被控端）"
+                    payload = {"ok": True, "action": action,
+                               "message": f"已下发『启动{label}』指令{target}"}
+                    if by_ip:
+                        payload["ip"] = ip
+                    if count is not None:
+                        payload["rule_count"] = count
+                    self._send(202, payload)
+                    return
+
+                # 锁定 / 解锁键盘鼠标：?on=1|0，可选 ip= 或 ips=a,b（都不带 = 全部在线被控端）
+                if path in ("/api/keyboard/lock", "/api/input/lock"):
+                    on_raw = (query.get("on", [""])[0] or "").strip().lower()
+                    if on_raw not in ("1", "0", "true", "false"):
+                        self._send(400, {"ok": False, "error": "missing or invalid on (1|0)"})
+                        return
+                    on = on_raw in ("1", "true")
+                    raw_ips = ",".join(query.get("ips", []) + query.get("ip", []))
+                    ips = ",".join(i.strip() for i in raw_ips.split(",") if i.strip())
+                    if outer.on_input_lock:
+                        outer.on_input_lock(ips, on)
+                    target = ips or "全部被控端"
+                    self._send(202, {"ok": True, "action": "input_lock", "on": on,
+                                     "message": f"已下发『{'锁定' if on else '解锁'}键鼠』指令: {target}"})
                     return
 
                 self._send(404, {"ok": False, "error": "not found", "path": path})

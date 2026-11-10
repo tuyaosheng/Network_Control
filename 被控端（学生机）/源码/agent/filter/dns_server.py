@@ -21,11 +21,15 @@ class FilterResolver(BaseResolver):
     def __init__(self, domains: list[str], upstream_dns: str,
                  mode: str = MODE_WHITELIST,
                  on_query: Callable[[str], None] | None = None,
-                 on_resolved_ips: Callable[[list[str]], None] | None = None):
+                 on_resolved_ips: Callable[[list[str]], None] | None = None,
+                 on_blocked: Callable[[str], None] | None = None):
         self._lock = threading.Lock()
         self.upstream_dns = upstream_dns
         self.mode = mode
         self.on_query = on_query
+        # 白名单模式下被拦截的域名（仅 A 查询，浏览器同时发 A/AAAA，只记一次），
+        # 供主控端「白名单还缺什么」汇总
+        self.on_blocked = on_blocked
         # 白名单模式：每次解析后把 A 记录里的 IP 通过此回调交给 firewall 模块加路由
         self.on_resolved_ips = on_resolved_ips
         self._domains: list[str] = []
@@ -93,6 +97,13 @@ class FilterResolver(BaseResolver):
         if self.mode == MODE_WHITELIST:
             if not matched:
                 logger.debug(f"[白名单拦截] {qname}")
+                if self.on_blocked and qtype == QTYPE.A:
+                    clean = qname.rstrip(".")
+                    if "." in clean and not clean.endswith(".local") and not clean.startswith("_"):
+                        try:
+                            self.on_blocked(clean)
+                        except Exception:
+                            pass
                 reply = request.reply()
                 reply.header.rcode = RCODE.NXDOMAIN
                 return reply
@@ -128,8 +139,10 @@ class LocalDNSServer:
                  mode: str = MODE_WHITELIST,
                  bind_addr: str = "127.0.0.1", port: int = 53,
                  on_query: Callable[[str], None] | None = None,
-                 on_resolved_ips: Callable[[list[str]], None] | None = None):
-        self.resolver = FilterResolver(domains, upstream_dns, mode, on_query, on_resolved_ips)
+                 on_resolved_ips: Callable[[list[str]], None] | None = None,
+                 on_blocked: Callable[[str], None] | None = None):
+        self.resolver = FilterResolver(domains, upstream_dns, mode, on_query,
+                                       on_resolved_ips, on_blocked)
         self.bind_addr = bind_addr
         self.port = port
         self._server: DNSServer | None = None

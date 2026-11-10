@@ -14,6 +14,7 @@ MSG_DISCONNECT      = "disconnect"
 MSG_RECONNECT       = "reconnect"
 MSG_ACK             = "ack"
 MSG_BROWSING_UPDATE = "browsing_update"   # 被控端 → 主控端：DNS 查询日志
+MSG_INPUT_LOCK      = "input_lock"        # 主控端 → 被控端：锁定 / 解锁键盘鼠标
 
 # ── 过滤模式 ─────────────────────────────────────────────────────
 MODE_WHITELIST = "whitelist"
@@ -39,18 +40,22 @@ def parse_msg(raw: str) -> dict:
 def msg_register(hostname: str, ip: str, mac: str) -> str:
     return make_msg(MSG_REGISTER, hostname=hostname, ip=ip, mac=mac)
 
-def msg_heartbeat(filter_active: bool, net_state: str = NET_NORMAL) -> str:
-    return make_msg(MSG_HEARTBEAT, filter_active=filter_active, net_state=net_state)
+def msg_heartbeat(filter_active: bool, net_state: str = NET_NORMAL,
+                  input_locked: bool = False) -> str:
+    return make_msg(MSG_HEARTBEAT, filter_active=filter_active, net_state=net_state,
+                    input_locked=input_locked)
 
 def msg_status(filter_active: bool, dns_running: bool,
-               rule_count: int, net_state: str = NET_NORMAL) -> str:
+               rule_count: int, net_state: str = NET_NORMAL,
+               input_locked: bool = False) -> str:
     return make_msg(MSG_STATUS, filter_active=filter_active,
                     dns_running=dns_running, rule_count=rule_count,
-                    net_state=net_state)
+                    net_state=net_state, input_locked=input_locked)
 
-def msg_browsing_update(domains: list) -> str:
-    """domains: [{"domain": str, "ts": str}, ...]"""
-    return make_msg(MSG_BROWSING_UPDATE, domains=domains)
+def msg_browsing_update(domains: list, blocked: list | None = None) -> str:
+    """domains: [{"domain": str, "ts": str}, ...]
+    blocked: 白名单模式下被拦截的域名累计 [{"domain": str, "count": int, "ts": str}, ...]"""
+    return make_msg(MSG_BROWSING_UPDATE, domains=domains, blocked=blocked or [])
 
 def msg_ack(ok: bool, message: str = "") -> str:
     return make_msg(MSG_ACK, ok=ok, message=message)
@@ -79,6 +84,9 @@ def msg_disconnect() -> str:
 
 def msg_reconnect() -> str:
     return make_msg(MSG_RECONNECT)
+
+def msg_input_lock(on: bool) -> str:
+    return make_msg(MSG_INPUT_LOCK, on=on)
 
 def msg_get_status() -> str:
     return make_msg(MSG_GET_STATUS)

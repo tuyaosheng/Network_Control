@@ -10,13 +10,13 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
     QPushButton, QLabel, QTabWidget, QDialog, QFormLayout, QLineEdit,
     QMessageBox, QHeaderView, QAbstractItemView, QListWidget, QListWidgetItem,
-    QProgressDialog
+    QProgressDialog, QCheckBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QEvent, QItemSelectionModel
 from PyQt6.QtGui import QKeySequence, QShortcut
 
 from controller.db.database import Database
-from controller.dep_discover import discover_dependencies
+from controller.dep_discover import discover_dependencies, _to_registrable_domain
 
 COL_CHECK  = 0
 COL_NAME   = 1
@@ -103,6 +103,88 @@ class _DepSelectDialog(QDialog):
             if item.checkState() == Qt.CheckState.Checked:
                 out.append(item.text())
         return out
+
+
+class _MissingDialog(QDialog):
+    """「白名单还缺什么」：汇总学生机在白名单期间被拦截的域名，勾选后一键加入白名单。
+
+    与「自动发现依赖」互补：后者事前静态扫描页面引用，扫不到运行时才请求的域名；
+    这里是事后看学生机真实被拦的 DNS 查询，页面打不开 / 图片视频缺失时照着补。"""
+
+    def __init__(self, blocked_fn, clear_fn, add_fn, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("白名单还缺什么（学生机被拦截的域名）")
+        self.setModal(True)
+        self.setMinimumSize(560, 460)
+        self._blocked_fn, self._clear_fn, self._add_fn = blocked_fn, clear_fn, add_fn
+        self.added = 0
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "下表是白名单过滤期间被 DNS 拦截的域名（次数越多越可能是页面必需的）。\n"
+            "勾选要放行的加入白名单；广告 / 统计类域名不必加。"
+        ))
+        self._table = QTableWidget(0, 4)
+        self._table.setHorizontalHeaderLabels(["加入", "域名", "次数", "台数"])
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        layout.addWidget(self._table)
+
+        self._chk_root = QCheckBox("按主域名添加（含全部子域名，如 a.b.example.com → example.com）")
+        layout.addWidget(self._chk_root)
+
+        row = QHBoxLayout()
+        btn_refresh = QPushButton("刷新")
+        btn_clear   = QPushButton("清空统计")
+        btn_ok      = QPushButton("加入白名单")
+        btn_close   = QPushButton("关闭")
+        btn_ok.setStyleSheet("background:#27ae60;color:white;padding:4px 18px;")
+        btn_refresh.clicked.connect(self._reload)
+        btn_clear.clicked.connect(self._on_clear)
+        btn_ok.clicked.connect(self._on_add)
+        btn_close.clicked.connect(self.accept)
+        for b in (btn_refresh, btn_clear):
+            row.addWidget(b)
+        row.addStretch()
+        row.addWidget(btn_ok)
+        row.addWidget(btn_close)
+        layout.addLayout(row)
+        self._reload()
+
+    def _reload(self):
+        rows = self._blocked_fn()
+        self._table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            chk = QTableWidgetItem()
+            chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            chk.setCheckState(Qt.CheckState.Unchecked)
+            self._table.setItem(i, 0, chk)
+            for col, text in ((1, r["domain"]), (2, str(r["count"])), (3, str(r["machines"]))):
+                it = QTableWidgetItem(text)
+                it.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                self._table.setItem(i, col, it)
+
+    def _on_clear(self):
+        self._clear_fn()
+        self._reload()
+
+    def _on_add(self):
+        picked: list[str] = []
+        for i in range(self._table.rowCount()):
+            if self._table.item(i, 0).checkState() == Qt.CheckState.Checked:
+                d = self._table.item(i, 1).text()
+                picked.append(_to_registrable_domain(d) if self._chk_root.isChecked() else d)
+        picked = list(dict.fromkeys(p for p in picked if p))
+        if not picked:
+            QMessageBox.information(self, "提示", "请先勾选要加入的域名")
+            return
+        added = sum(1 for d in picked if self._add_fn(d, d))
+        self.added += added
+        QMessageBox.information(
+            self, "完成",
+            f"已加入 {added} 条" + (f"，{len(picked) - added} 条已存在" if added < len(picked) else "")
+        )
 
 
 class _AddDialog(QDialog):
@@ -217,6 +299,7 @@ class _AddDialog(QDialog):
 
 class _RuleTab(QWidget):
     changed = pyqtSignal()
+    missing_added = pyqtSignal()   # 「还缺什么」里加了域名（需热推送给正在白名单的机器）
 
     def __init__(self, db: Database, list_fn, add_fn, set_enabled_fn, update_fn,
                  del_fn, add_dialog_title: str, allow_discover: bool = False,
@@ -230,6 +313,8 @@ class _RuleTab(QWidget):
         self._del_fn = del_fn
         self._add_dialog_title = add_dialog_title
         self._allow_discover = allow_discover
+        self._blocked_fn = None   # 由 RulePanel.set_missing_provider 注入
+        self._clear_blocked_fn = None
         self._build_ui()
         self.reload()
 
@@ -271,6 +356,11 @@ class _RuleTab(QWidget):
         btn_row.addWidget(btn_on)
         btn_row.addWidget(btn_off)
         btn_row.addWidget(btn_del)
+        if self._allow_discover:
+            btn_missing = QPushButton("📋 还缺什么")
+            btn_missing.setStyleSheet("background:#8e44ad;color:white;padding:4px 14px;")
+            btn_missing.clicked.connect(self._show_missing)
+            btn_row.addWidget(btn_missing)
         btn_row.addStretch()
         QShortcut(QKeySequence(QKeySequence.StandardKey.Delete), self._table,
                   activated=self._del_entry,
@@ -387,6 +477,17 @@ class _RuleTab(QWidget):
         self.reload()
         self.changed.emit()
 
+    def _show_missing(self):
+        if not self._blocked_fn:
+            return
+        dlg = _MissingDialog(self._blocked_fn, self._clear_blocked_fn or (lambda: None),
+                             self._add_fn, self)
+        dlg.exec()
+        if dlg.added:
+            self.reload()
+            self.changed.emit()
+            self.missing_added.emit()
+
     def _del_entry(self):
         rows = self._selected_rows()
         if not rows:
@@ -434,6 +535,7 @@ class _RuleTab(QWidget):
 
 class RulePanel(QWidget):
     sig_rules_changed = pyqtSignal()
+    sig_whitelist_hot = pyqtSignal()   # 「还缺什么」加了域名 → 主窗口热推送给正在白名单的机器
 
     def __init__(self, db: Database, parent=None):
         super().__init__(parent)
@@ -457,6 +559,7 @@ class RulePanel(QWidget):
             allow_discover=True,
         )
         self._whitelist_tab.changed.connect(self.sig_rules_changed)
+        self._whitelist_tab.missing_added.connect(self.sig_whitelist_hot)
         tabs.addTab(self._whitelist_tab, "白名单")
 
         self._blacklist_tab = _RuleTab(
@@ -472,6 +575,11 @@ class RulePanel(QWidget):
         tabs.addTab(self._blacklist_tab, "黑名单")
 
         layout.addWidget(tabs)
+
+    def set_missing_provider(self, blocked_fn, clear_fn):
+        """注入「被拦截域名」数据源（汇总函数 / 清空函数）。"""
+        self._whitelist_tab._blocked_fn = blocked_fn
+        self._whitelist_tab._clear_blocked_fn = clear_fn
 
     def reload(self):
         self._whitelist_tab.reload()

@@ -91,6 +91,12 @@ if __name__ == "__main__":
         from agent.ui.lock_screen import run_lock_screen
         run_lock_screen(hash_val)
 
+    # 键鼠锁定模式：CTR.exe --input-lock <agent_pid>
+    elif len(sys.argv) >= 2 and sys.argv[1] == "--input-lock":
+        pid = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 0
+        from agent.ui.input_lock import run_input_lock
+        run_input_lock(pid)
+
     elif len(sys.argv) == 1:
         # SCM 分发模式
         servicemanager.Initialize()

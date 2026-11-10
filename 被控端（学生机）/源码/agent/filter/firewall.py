@@ -255,7 +255,8 @@ def _ps_metric_arg(metric) -> str:
 _whitelist_host_routes: set[str] = set()   # 记录已添加的白名单主机路由，用于清理
 _cached_gateway: tuple[str, int] = ("", 0)  # 白名单模式下默认路由被删后用于动态添加主机路由的网关
 _dynamic_routes_lock = threading.Lock()     # 保护并发写路由表
-_onlink_nets: list = []                     # 本机直连（on-link）网段，见 _refresh_onlink_nets()
+_lan_net_routes: set[str] = set()           # 已添加的局域网网段路由（CIDR），见 _add_lan_net_routes()
+_onlink_nets: list = []                   # 本机直连（on-link）网段，见 _refresh_onlink_nets()
 
 
 def _refresh_onlink_nets() -> list:
@@ -302,20 +303,58 @@ def _clean_whitelist_routes():
     """批量移除之前通过 apply_whitelist_routing/add_host_routes_dynamic 添加的所有 /32 主机路由。"""
     global _whitelist_host_routes, _cached_gateway
     with _dynamic_routes_lock:
-        if not _whitelist_host_routes:
-            _cached_gateway = ("", 0)
-            return
         ips = list(_whitelist_host_routes)
+        nets = list(_lan_net_routes)
         _whitelist_host_routes.clear()
+        _lan_net_routes.clear()
         _cached_gateway = ("", 0)
+    if not ips and not nets:
+        return
 
     # 批量删除，避免一次开几百个 PowerShell 进程；按命令行长度上限自动分批
+    prefixes = [f"{ip}/32" for ip in ips] + nets
     parts = [
-        f'try {{ Remove-NetRoute -DestinationPrefix "{ip}/32" -Confirm:$false -ErrorAction SilentlyContinue }} catch {{}};'
-        for ip in ips
+        f'try {{ Remove-NetRoute -DestinationPrefix "{p}" -Confirm:$false -ErrorAction SilentlyContinue }} catch {{}};'
+        for p in prefixes
     ]
     _run_ps_batched(parts, timeout=60)
-    logger.debug(f"已清除 {len(ips)} 条白名单主机路由")
+    logger.debug(f"已清除 {len(ips)} 条白名单主机路由 + {len(nets)} 条局域网网段路由")
+
+
+def _add_lan_net_routes(lan_subnets: list[str], gw_ip: str, gw_idx: int):
+    """
+    为 lan_subnets 里的网段加【网段路由】（经原网关），删默认路由后跨网段的局域网仍可互通。
+    例：lan_subnets 配成覆盖多个机房的大网段时，不同机房（不同 /24）的机器
+    靠网关三层转发互访；这些包原本走默认路由，默认路由一删就全断。
+
+    本机直连网段（及其子网）跳过：on-link 路由本来就更具体，强行加经网关的路由会拐包。
+    """
+    parts, wanted = [], []
+    for s in lan_subnets:
+        try:
+            net = ipaddress.ip_network(s.strip(), strict=False)
+        except ValueError:
+            logger.warning(f"忽略无效局域网网段: {s!r}")
+            continue
+        if net.version != 4 or net.prefixlen == 0:
+            continue
+        if any(net.subnet_of(o) for o in _onlink_nets):
+            continue
+        p = str(net)
+        wanted.append(p)
+        parts.append(
+            f'try {{ Remove-NetRoute -DestinationPrefix "{p}" -NextHop "{gw_ip}" -Confirm:$false -ErrorAction SilentlyContinue }} catch {{}};'
+            f'try {{ New-NetRoute -DestinationPrefix "{p}" -NextHop "{gw_ip}" '
+            f'-InterfaceIndex {gw_idx} -RouteMetric 1 -ErrorAction Stop | Out-Null; '
+            f'Write-Output "OK {p}" }} catch {{ Write-Output "FAIL {p} $($_.Exception.Message)" }};'
+        )
+    if not parts:
+        return
+    out = _run_ps_batched(parts, timeout=60)
+    added = {l.strip()[3:].strip() for l in (out or "").splitlines() if l.strip().startswith("OK ")}
+    with _dynamic_routes_lock:
+        _lan_net_routes.update(added)
+    logger.info(f"局域网网段路由已添加 {len(added)}/{len(wanted)} 条: {sorted(added)}")
 
 
 def add_host_routes_dynamic(ips: list[str]) -> set[str]:
@@ -372,7 +411,7 @@ def _delete_default_route() -> bool:
     return ok
 
 
-def disconnect_internet(controller_ip: str = "") -> bool:
+def disconnect_internet(controller_ip: str = "", lan_subnets: list[str] | None = None) -> bool:
     """
     彻底断网（用于状态切换：→ disconnect / → blacklist / → normal 前）：
     清理 whitelist 主机路由 + 删除默认路由。
@@ -381,7 +420,7 @@ def disconnect_internet(controller_ip: str = "") -> bool:
     """
     global _whitelist_host_routes
     _clean_whitelist_routes()   # 状态切换时才清理白名单路由
-    if controller_ip:
+    if controller_ip or lan_subnets:
         _refresh_onlink_nets()  # 主控端若与本机同网段，下面会跳过加主机路由
         gws = _get_default_gateways()
         if gws:
@@ -389,6 +428,9 @@ def disconnect_internet(controller_ip: str = "") -> bool:
             gw_ip  = gw.get("NextHop", "")
             gw_idx = gw.get("InterfaceIndex", 0)
             if gw_ip and gw_ip not in ("0.0.0.0", "::", ""):
+                if lan_subnets:
+                    _add_lan_net_routes(lan_subnets, gw_ip, gw_idx)
+            if controller_ip and gw_ip and gw_ip not in ("0.0.0.0", "::", ""):
                 if _is_onlink(controller_ip):
                     # 同网段：on-link 子网路由本来就在，删默认路由影响不到它，无需也不能加主机路由
                     logger.info(f"主控端 {controller_ip} 与本机同网段，断网后靠 on-link 直达，无需保留路由")
@@ -529,6 +571,7 @@ def apply_whitelist_routing(whitelist_domains: list[str],
 
     added = _add_host_routes_bulk(sorted(baseline), gw_ip, gw_idx)
     logger.info(f"基线主机路由已添加 {len(added)}/{len(baseline)} 条（上游 DNS + 主控端）")
+    _add_lan_net_routes(lan_subnets, gw_ip, gw_idx)
 
     # 把网关信息缓存起来，供后续 dns_server 动态加路由使用
     with _dynamic_routes_lock:

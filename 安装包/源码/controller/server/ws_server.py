@@ -1,0 +1,319 @@
+"""
+主控端 WebSocket 服务器 - 管理所有被控端连接，下发指令
+"""
+import asyncio
+import logging
+import socket
+import ipaddress
+from collections import deque
+from datetime import datetime
+from typing import Callable
+
+import websockets
+from websockets.server import WebSocketServerProtocol
+
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+from shared.protocol import (
+    MSG_REGISTER, MSG_HEARTBEAT, MSG_STATUS, MSG_ACK, MSG_BROWSING_UPDATE,
+    MODE_WHITELIST, MODE_BLACKLIST,
+    parse_msg, msg_update_rules, msg_set_filter,
+    msg_disconnect, msg_reconnect, msg_get_status, msg_input_lock
+)
+
+logger = logging.getLogger("ws_server")
+
+
+def _ws_local_ip(ws) -> str:
+    """取本连接的本端 IP（被控端连过来时打在主控端哪张网卡上）。"""
+    try:
+        return ws.local_address[0] if ws else ""
+    except Exception:
+        return ""
+
+
+class ConnectedAgent:
+    def __init__(self, ws: WebSocketServerProtocol | None, ip: str):
+        self.ws            = ws
+        self.ip            = ip
+        # 本连接的【本端】地址：被控端实际连到主控端的哪个 IP。
+        # 多网卡教师机（有线+无线 / VPN / 虚拟网卡）不能靠 connect("8.8.8.8") 猜，
+        # 那样拿到的是朝互联网那张网卡，下发给被控端后它会给错误 IP 加主机路由，
+        # 断网后就连不回主控端了。
+        self.local_ip      = _ws_local_ip(ws)
+        self.hostname      = ""
+        self.mac           = ""
+        self.filter_active = False
+        self.net_state     = "normal"
+        self.input_locked  = False
+        self.blocked: dict[str, dict] = {}   # 白名单期间被拦截的域名累计（被控端快照整体替换）
+        self.is_online     = True
+        self.connected_at  = datetime.now()
+        self.last_seen     = datetime.now()
+        self.recent_domains: deque = deque(maxlen=30)
+
+    def to_dict(self) -> dict:
+        return {
+            "ip":             self.ip,
+            "hostname":       self.hostname,
+            "mac":            self.mac,
+            "filter_active":  self.filter_active,
+            "net_state":      self.net_state,
+            "input_locked":   self.input_locked,
+            "is_online":      self.is_online,
+            "connected_at":   self.connected_at.strftime("%H:%M:%S"),
+            "last_seen":      self.last_seen.strftime("%H:%M:%S"),
+            "recent_domains": list(self.recent_domains),
+        }
+
+
+class ControllerServer:
+    def __init__(self, host: str = "0.0.0.0", port: int = 8765,
+                 on_agent_change: Callable | None = None,
+                 on_agent_reconnect: Callable | None = None,
+                 initial_states: dict | None = None):
+        self.host              = host
+        self.port              = port
+        self.on_agent_change   = on_agent_change
+        self._on_agent_reconnect = on_agent_reconnect
+        self._agents: dict[str, ConnectedAgent]         = {}   # 在线
+        self._offline: dict[str, ConnectedAgent]        = {}   # 曾连接但已断开
+        self._saved_states: dict[str, str]              = initial_states or {}
+        self._saved_input_lock: set[str]                = set()   # 老师锁了键鼠的 IP（重连恢复用）
+        self._lock   = asyncio.Lock()
+        self._server = None
+
+    # ── 公开接口 ─────────────────────────────────────────────────
+
+    def get_agents(self) -> list[dict]:
+        """返回所有被控端（在线在前，离线在后）。"""
+        online  = [a.to_dict() for a in self._agents.values()]
+        offline = [a.to_dict() for a in self._offline.values()]
+        return online + offline
+
+    def get_online_ips(self) -> list[str]:
+        return list(self._agents.keys())
+
+    def update_saved_state(self, ip: str, net_state: str):
+        self._saved_states[ip] = net_state
+
+    async def push_rules(self, domains: list[str], lan_subnets: list[str],
+                         upstream_dns: str, mode: str = MODE_WHITELIST,
+                         target_ip: str | None = None,
+                         tray_pwd_hash: str = "",
+                         unlock_pwd_hash: str = ""):
+        """下发规则。controller_ip 按【每台被控端各自连到的本端 IP】逐台生成——
+        多网卡教师机（有线+无线 / VPN / 虚拟网卡）若统一用 connect("8.8.8.8") 猜，
+        会把朝互联网那张网卡的 IP 发下去，被控端断网后按错误 IP 加主机路由就连不回来了。"""
+        async with self._lock:
+            targets = self._resolve_targets(target_ip)
+        fallback = self._get_local_ip()
+        failed = []
+        for agent in targets:
+            controller_ip = agent.local_ip or fallback
+            raw = msg_update_rules(domains, lan_subnets, controller_ip, upstream_dns,
+                                   mode, tray_pwd_hash, unlock_pwd_hash)
+            try:
+                await agent.ws.send(raw)
+            except Exception as e:
+                logger.warning(f"发送失败 [{agent.ip}]: {e}")
+                failed.append(agent.ip)
+        await self._drop_failed(failed)
+
+    async def set_filter(self, enabled: bool, mode: str = MODE_WHITELIST,
+                         target_ip: str | None = None):
+        raw = msg_set_filter(enabled, mode)
+        await self._broadcast(raw, target_ip)
+
+    async def disconnect_internet(self, target_ip: str | None = None):
+        await self._broadcast(msg_disconnect(), target_ip)
+
+    async def reconnect_internet(self, target_ip: str | None = None):
+        await self._broadcast(msg_reconnect(), target_ip)
+
+    async def set_input_lock(self, on: bool, target_ip: str | None = None):
+        """锁定 / 解锁键盘鼠标。target_ip 为空 = 全部在线被控端。"""
+        await self._broadcast(msg_input_lock(on), target_ip)
+
+    def update_saved_input_lock(self, ips: list[str], on: bool):
+        for ip in ips:
+            (self._saved_input_lock.add if on else self._saved_input_lock.discard)(ip)
+
+    def is_input_lock_saved(self, ip: str) -> bool:
+        return ip in self._saved_input_lock
+
+    def get_blocked_summary(self) -> list[dict]:
+        """汇总各被控端白名单期间被拦截的域名：[{domain, count, machines, ts}]，按次数降序。"""
+        agg: dict[str, dict] = {}
+        for a in list(self._agents.values()) + list(self._offline.values()):
+            for d, rec in list(a.blocked.items()):
+                x = agg.setdefault(d, {"domain": d, "count": 0, "machines": 0, "ts": ""})
+                x["count"] += rec.get("count", 0)
+                x["machines"] += 1
+                x["ts"] = max(x["ts"], rec.get("ts", ""))
+        return sorted(agg.values(), key=lambda r: (-r["count"], r["domain"]))
+
+    def clear_blocked(self):
+        for a in list(self._agents.values()) + list(self._offline.values()):
+            a.blocked.clear()
+
+    async def request_status(self, target_ip: str | None = None):
+        await self._broadcast(msg_get_status(), target_ip)
+
+    # ── 内部逻辑 ─────────────────────────────────────────────────
+
+    def _resolve_targets(self, target_ip: str | None) -> list[ConnectedAgent]:
+        """target_ip 为空 → 全部在线；指定了 IP → 只发给它，不在线就一个都不发。
+        （旧逻辑在 IP 不在线时退化成广播：按 IP 禁一台已关机的学生机会让全班断网。
+        不在线的机器由调用方保存的权威状态在它上线注册时恢复。）调用方须持有 self._lock。"""
+        if not target_ip:
+            return list(self._agents.values())
+        agent = self._agents.get(target_ip)
+        if agent is None:
+            logger.info(f"目标 {target_ip} 不在线，暂不下发（上线后按保存的状态恢复）")
+            return []
+        return [agent]
+
+    async def _broadcast(self, raw: str, target_ip: str | None):
+        async with self._lock:
+            targets = self._resolve_targets(target_ip)
+        failed = []
+        for agent in targets:
+            try:
+                await agent.ws.send(raw)
+            except Exception as e:
+                logger.warning(f"发送失败 [{agent.ip}]: {e}")
+                failed.append(agent.ip)
+        await self._drop_failed(failed)
+
+    async def _drop_failed(self, failed: list[str]):
+        """把发送失败的被控端移到离线池。"""
+        for ip in failed:
+            async with self._lock:
+                agent = self._agents.pop(ip, None)
+                if agent:
+                    agent.ws        = None
+                    agent.is_online = False
+                    self._offline[ip] = agent
+            self._notify_change()
+
+    async def _handle_connection(self, ws: WebSocketServerProtocol):
+        ip = ws.remote_address[0]
+        logger.info(f"新连接: {ip}")
+
+        async with self._lock:
+            # 若是曾经连过的离线机器重连，复用其历史信息（含断线前的 net_state）
+            prev = self._offline.pop(ip, None)
+            if prev:
+                agent = prev
+                agent.ws        = ws
+                agent.is_online = True
+                agent.local_ip  = _ws_local_ip(ws)   # 重连可能落在另一张网卡上，刷新
+                agent.connected_at = datetime.now()
+            else:
+                agent = ConnectedAgent(ws, ip)
+                # 跨会话（主控重启后）：从持久化状态恢复 net_state
+                saved = self._saved_states.get(ip, "normal")
+                if saved != "normal":
+                    agent.net_state = saved
+            self._agents[ip] = agent
+
+        try:
+            async for raw in ws:
+                await self._handle_message(agent, raw)
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        except Exception as e:
+            logger.error(f"连接异常 [{ip}]: {e}")
+        finally:
+            async with self._lock:
+                self._agents.pop(ip, None)
+                agent.ws        = None
+                agent.is_online = False
+                self._offline[ip] = agent
+            logger.info(f"断开连接: {ip}")
+            self._notify_change()
+
+    async def _handle_message(self, agent: ConnectedAgent, raw: str):
+        try:
+            msg = parse_msg(raw)
+        except Exception:
+            return
+        t = msg.get("type")
+        agent.last_seen = datetime.now()
+
+        if t == MSG_REGISTER:
+            agent.hostname = msg.get("hostname", "")
+            agent.mac      = msg.get("mac", "")
+            logger.info(f"注册: {agent.ip} ({agent.hostname})")
+            self._notify_change()
+            # 被控端开机默认断网（fail-closed），注册时按【老师设过的权威状态】下发，含 normal=放行。
+            # 必须用 _saved_states（老师意图），不能用 agent.net_state——后者会被"开机临时断网"的
+            # 自报污染，导致每次开机都被误判为断网、即使老师从没设过断网也开不了网。
+            if self._on_agent_reconnect:
+                authoritative = self._saved_states.get(agent.ip, "normal")
+                asyncio.create_task(self._on_agent_reconnect(agent.ip, authoritative))
+
+        elif t in (MSG_HEARTBEAT, MSG_STATUS):
+            agent.filter_active = msg.get("filter_active", False)
+            agent.net_state     = msg.get("net_state", "normal")
+            agent.input_locked  = msg.get("input_locked", agent.input_locked)
+            self._notify_change()
+
+        elif t == MSG_BROWSING_UPDATE:
+            domains = msg.get("domains", [])
+            for d in domains:
+                agent.recent_domains.append(d)
+            if "blocked" in msg:
+                agent.blocked = {r["domain"]: r for r in msg["blocked"] if r.get("domain")}
+            self._notify_change()
+
+        elif t == MSG_ACK:
+            logger.info(f"ACK [{agent.ip}]: {msg.get('message', '')}")
+
+    def _notify_change(self):
+        if self.on_agent_change:
+            self.on_agent_change()
+
+    @staticmethod
+    def _get_local_ip() -> str:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "127.0.0.1"
+
+    async def start(self):
+        self._server = await websockets.serve(
+            self._handle_connection, self.host, self.port,
+            ping_interval=30, ping_timeout=10
+        )
+        logger.info(f"WebSocket服务器已启动: {self.host}:{self.port}")
+
+    async def stop(self):
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+
+
+async def scan_ip_range(subnet: str, port: int = 8765,
+                        timeout: float = 0.5) -> list[str]:
+    network = ipaddress.IPv4Network(subnet, strict=False)
+    results = []
+
+    async def check(ip_str):
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip_str, port), timeout=timeout
+            )
+            writer.close()
+            await writer.wait_closed()
+            results.append(ip_str)
+        except Exception:
+            pass
+
+    await asyncio.gather(*[check(str(ip)) for ip in network.hosts()])
+    return sorted(results)

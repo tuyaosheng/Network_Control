@@ -52,6 +52,9 @@ class Signals(QObject):
     api_disable    = pyqtSignal()
     api_enable_ip  = pyqtSignal(str)   # 按 IP 开单台（学习平台调用）
     api_disable_ip = pyqtSignal(str)   # 按 IP 禁单台（学习平台同步状态调用）
+    api_whitelist  = pyqtSignal(str)   # 启动白名单，参数为 IP（空串 = 全部）
+    api_blacklist  = pyqtSignal(str)   # 启动黑名单，参数为 IP（空串 = 全部）
+    api_input_lock = pyqtSignal(str, bool)   # 锁/解键鼠，参数为 逗号分隔的 IP（空串 = 全部）、是否锁定
 
 
 class MainWindow(QMainWindow):
@@ -97,6 +100,9 @@ class MainWindow(QMainWindow):
         self._signals.api_disable.connect(self._on_api_disable)
         self._signals.api_enable_ip.connect(self._on_api_enable_ip)
         self._signals.api_disable_ip.connect(self._on_api_disable_ip)
+        self._signals.api_whitelist.connect(self._on_api_whitelist)
+        self._signals.api_blacklist.connect(self._on_api_blacklist)
+        self._signals.api_input_lock.connect(self._on_api_input_lock)
 
     # ── UI 构建 ───────────────────────────────────────────────────
 
@@ -119,10 +125,14 @@ class MainWindow(QMainWindow):
         self._machine_panel.sig_start_blacklist.connect(self._on_start_blacklist)
         self._machine_panel.sig_disconnect.connect(self._on_disconnect)
         self._machine_panel.sig_scan.connect(self._on_scan)
+        self._machine_panel.sig_input_lock.connect(self._on_input_lock)
         top_split.addWidget(self._machine_panel)
 
         right_tabs = QTabWidget()
         self._rule_panel = RulePanel(self.db)
+        self._rule_panel.set_missing_provider(
+            self.server.get_blocked_summary, self.server.clear_blocked)
+        self._rule_panel.sig_whitelist_hot.connect(self._push_whitelist_hot)
         right_tabs.addTab(self._rule_panel, "规则管理")
         right_tabs.addTab(self._build_settings_tab(), "设置")
         top_split.addWidget(right_tabs)
@@ -264,12 +274,18 @@ class MainWindow(QMainWindow):
                 on_disable=self._signals.api_disable.emit,
                 on_enable_ip=self._signals.api_enable_ip.emit,
                 on_disable_ip=self._signals.api_disable_ip.emit,
+                on_whitelist=self._signals.api_whitelist.emit,
+                on_blacklist=self._signals.api_blacklist.emit,
+                on_input_lock=self._signals.api_input_lock.emit,
+                # 只读查询，Database 每次调用独立连接 + 锁，可在 API 线程直接调用
+                count_rules=self._count_enabled_rules,
                 get_status=self.server.get_agents,
             )
             self._api_server.start()
             self._signals.log_msg.emit(
                 f"控制接口已启动: http://{host}:{port}  "
-                f"（开网 /api/network/enable，禁网 /api/network/disable）"
+                f"（开网 /api/network/enable，禁网 /api/network/disable，"
+                f"白名单 /api/network/whitelist，黑名单 /api/network/blacklist）"
             )
         except Exception as e:
             self._api_server = None
@@ -294,6 +310,59 @@ class MainWindow(QMainWindow):
         """外部接口（学习平台）触发的『按 IP 禁网』，等价于对该机器点击「禁止上网」。"""
         self._append_log(f"[API] 收到『禁网』请求: {ip}")
         self._on_disconnect([ip])
+
+    def _on_api_input_lock(self, ips_csv: str, on: bool):
+        """外部接口触发的『锁/解键鼠』：ips 为空 = 全部在线被控端。"""
+        ips = [i for i in ips_csv.split(",") if i]
+        self._append_log(f"[API] 收到『{'锁定' if on else '解锁'}键鼠』请求: {ips_csv or '全部'}")
+        self._on_input_lock(ips, on)
+
+    def _push_whitelist_hot(self):
+        """白名单有新增：把最新名单热推送给【正在白名单过滤】的在线机器（被控端 DNS 热更新，无需重启过滤）。"""
+        domains = self.db.get_enabled_whitelist()
+        ips = [a["ip"] for a in self.server.get_agents()
+               if a.get("is_online") and a.get("net_state") == "whitelist"]
+        if not domains or not ips:
+            return
+        lan_subnets, upstream = self._get_lan_upstream()
+        tray_hash, unlock_hash = self._get_pwd_hashes()
+
+        async def _do():
+            for ip in ips:
+                await self.server.push_rules(
+                    domains, lan_subnets, upstream, mode=MODE_WHITELIST, target_ip=ip,
+                    tray_pwd_hash=tray_hash, unlock_pwd_hash=unlock_hash)
+
+        self._run_async(_do())
+        self._append_log(f"[操作] 白名单已更新，已热推送给 {len(ips)} 台正在白名单的被控端（{len(domains)} 条）")
+
+    def _on_input_lock(self, ips: list[str], on: bool):
+        """锁定 / 解锁键盘鼠标。记录老师意图，被控端重连（重启）后按它恢复。"""
+        targets = ips if ips else [None]
+
+        async def _do():
+            for ip in targets:
+                await self.server.set_input_lock(on, ip)
+
+        self._run_async(_do())
+        self.server.update_saved_input_lock(ips if ips else self.server.get_online_ips(), on)
+        n = "全部" if not ips else f"{len(ips)} 台"
+        self._append_log(f"[操作] 已向 {n} 被控端发送「{'锁定' if on else '解锁'}键鼠」")
+
+    def _count_enabled_rules(self, mode: str) -> int:
+        if mode == "whitelist":
+            return len(self.db.get_enabled_whitelist())
+        return len(self.db.get_enabled_blacklist())
+
+    def _on_api_whitelist(self, ip: str):
+        """外部接口触发的『启动白名单』：ip 为空 = 全部被控端，否则只对该机器。"""
+        self._append_log(f"[API] 收到『启动白名单』请求: {ip or '全部'}")
+        self._on_start_whitelist([ip] if ip else [], interactive=False)
+
+    def _on_api_blacklist(self, ip: str):
+        """外部接口触发的『启动黑名单』：ip 为空 = 全部被控端，否则只对该机器。"""
+        self._append_log(f"[API] 收到『启动黑名单』请求: {ip or '全部'}")
+        self._on_start_blacklist([ip] if ip else [], interactive=False)
 
     def _on_agent_change(self):
         self._signals.agents_changed.emit()
@@ -326,6 +395,8 @@ class MainWindow(QMainWindow):
         else:
             # normal 或未知：明确放行（被控端开机默认断网，需主控端确认才上网）
             await self.server.reconnect_internet(ip)
+        if self.server.is_input_lock_saved(ip):
+            await self.server.set_input_lock(True, ip)
         self._signals.log_msg.emit(f"[重连恢复] {ip} 已重新应用状态: {state}")
 
     def _refresh_machines(self):
@@ -357,10 +428,13 @@ class MainWindow(QMainWindow):
         unlock_hash = self.db.get_setting("unlock_password", "")
         return tray_hash, unlock_hash
 
-    def _on_start_whitelist(self, ips: list[str]):
+    def _on_start_whitelist(self, ips: list[str], interactive: bool = True):
         domains = self.db.get_enabled_whitelist()
         if not domains:
-            QMessageBox.warning(self, "提示", "白名单为空，请先在「规则管理 → 白名单」中添加域名")
+            if interactive:
+                QMessageBox.warning(self, "提示", "白名单为空，请先在「规则管理 → 白名单」中添加域名")
+            else:
+                self._append_log("[API] 白名单为空，未下发")
             return
         lan_subnets, upstream = self._get_lan_upstream()
         tray_hash, unlock_hash = self._get_pwd_hashes()
@@ -384,10 +458,13 @@ class MainWindow(QMainWindow):
             f"[操作] 已向 {n} 被控端启动白名单过滤（{len(domains)} 条域名）"
         )
 
-    def _on_start_blacklist(self, ips: list[str]):
+    def _on_start_blacklist(self, ips: list[str], interactive: bool = True):
         domains = self.db.get_enabled_blacklist()
         if not domains:
-            QMessageBox.warning(self, "提示", "黑名单为空，请先在「规则管理 → 黑名单」中添加域名")
+            if interactive:
+                QMessageBox.warning(self, "提示", "黑名单为空，请先在「规则管理 → 黑名单」中添加域名")
+            else:
+                self._append_log("[API] 黑名单为空，未下发")
             return
         lan_subnets, upstream = self._get_lan_upstream()
         tray_hash, unlock_hash = self._get_pwd_hashes()

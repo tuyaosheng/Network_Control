@@ -35,6 +35,7 @@ a = Analysis(
         'agent.tray.tray_icon',
         'agent.ui',
         'agent.ui.lock_screen',
+        'agent.ui.input_lock',
         'shared.protocol',
         'shared.paths',
         # PIL（托盘图标）
